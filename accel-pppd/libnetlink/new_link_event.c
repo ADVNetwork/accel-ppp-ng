@@ -47,7 +47,8 @@ static int nnle_nlmsg_handler(const struct sockaddr_nl *nladdr,
 	if (tb[IFLA_IFNAME] && strlen(RTA_DATA(tb[IFLA_IFNAME])) < IFNAMSIZ)
 		strncpy(ifname, RTA_DATA(tb[IFLA_IFNAME]), IFNAMSIZ - 1);
 
-	if (hdr->nlmsg_type == RTM_NEWLINK && *(uint32_t *)RTA_DATA(tb[IFLA_OPERSTATE]) == IF_OPER_DOWN) {
+	if (hdr->nlmsg_type == RTM_NEWLINK && tb[IFLA_OPERSTATE] &&
+	    *(uint32_t *)RTA_DATA(tb[IFLA_OPERSTATE]) == IF_OPER_DOWN) {
 
 		struct ifreq ifr;
 		memset(&ifr, 0, sizeof(ifr));
@@ -60,8 +61,15 @@ static int nnle_nlmsg_handler(const struct sockaddr_nl *nladdr,
 		}
 	}
 
-	if (hdr->nlmsg_type == RTM_NEWLINK && *(uint32_t *)RTA_DATA(tb[IFLA_OPERSTATE]) == IF_OPER_UP) {
-		nnle_emit_callbacks(ifname, 1);
+	/* IF_OPER_UP: link is up. IF_OPER_UNKNOWN: many virtual interfaces (veth,
+	 * tun/tap, VPP/DPDK bridges) don't implement L1 carrier state and report
+	 * UNKNOWN permanently even when operational. Treat both as "link up" so
+	 * PPPoE can start on virtual topologies. Trade-off: physical interfaces
+	 * that lose carrier but report UNKNOWN may trigger false start - rare. */
+	if (hdr->nlmsg_type == RTM_NEWLINK && tb[IFLA_OPERSTATE]) {
+		uint32_t operstate = *(uint32_t *)RTA_DATA(tb[IFLA_OPERSTATE]);
+		if (operstate == IF_OPER_UP || operstate == IF_OPER_UNKNOWN)
+			nnle_emit_callbacks(ifname, 1);
 	} else if (hdr->nlmsg_type == RTM_DELLINK) {
 		nnle_emit_callbacks(ifname, 0);
 	}

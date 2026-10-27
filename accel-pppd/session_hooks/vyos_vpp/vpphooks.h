@@ -24,5 +24,6 @@ struct vpphook_private_data_t {
 };
 
 struct vpphook_private_data_t *vpphook_get_pd(struct ap_session *ses);
+int vpphook_get_sw_if_index(struct ap_session *ses, uint32_t *sw_if_index);
 
 #endif /* VPPHOOKS_H */

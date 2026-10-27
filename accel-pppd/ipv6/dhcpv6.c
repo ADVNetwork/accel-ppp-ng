@@ -201,24 +201,25 @@ static void ev_ses_finished(struct ap_session *ses)
 	_free(pd);
 }
 
-static void insert_dp_routes(struct ap_session *ses, struct dhcpv6_pd *pd, struct in6_addr *addr)
+static int insert_dp_routes(struct ap_session *ses, struct dhcpv6_pd *pd, struct in6_addr *addr)
 {
 	struct ipv6db_addr_t *p;
 	char str1[INET6_ADDRSTRLEN];
 	char str2[INET6_ADDRSTRLEN];
-	int err;
+	int ret, all_ok = 1;
 
 	if (!conf_route_via_gw || (addr && IN6_IS_ADDR_UNSPECIFIED(addr)))
 		addr = NULL;
 
 	list_for_each_entry(p, &ses->ipv6_dp->prefix_list, entry) {
-		if (accel_ip6route_add(ses, ses->ifindex, &p->addr, p->prefix_len, addr, 0, 0, ses->vrf_name)) {
-			err = errno;
+		ret = accel_ip6route_add(ses, ses->ifindex, &p->addr, p->prefix_len, addr, 0, 0, ses->vrf_name);
+		if (ret) {
+			all_ok = 0;
 			inet_ntop(AF_INET6, &p->addr, str1, sizeof(str1));
 			if (addr)
 				inet_ntop(AF_INET6, addr, str2, sizeof(str2));
-			log_ppp_error("dhcpv6: route add %s/%i%s%s: %s\n", str1, p->prefix_len,
-					addr ? " via " : "", str2, strerror(err));
+			log_ppp_error("dhcpv6: route add %s/%i%s%s: ret=%d\n", str1, p->prefix_len,
+					addr ? " via " : "", str2, ret);
 		} else if (conf_verbose) {
 			inet_ntop(AF_INET6, &p->addr, str1, sizeof(str1));
 			if (addr)
@@ -228,7 +229,12 @@ static void insert_dp_routes(struct ap_session *ses, struct dhcpv6_pd *pd, struc
 		}
 	}
 
-	pd->dp_active = 1;
+	if (all_ok) {
+		pd->dp_active = 1;
+		return 0;
+	}
+
+	return -1;
 }
 
 static void insert_status(struct dhcpv6_packet *pkt, struct dhcpv6_option *opt, int code)
@@ -416,6 +422,7 @@ static void dhcpv6_send_reply(struct dhcpv6_packet *req, struct dhcpv6_pd *pd, i
 				if (ses->ipv6_dp)
 					triton_event_fire(EV_FORCE_INTERIM_UPDATE, ses);
 				else {
+                    log_error("dhcpv6: no free IPv6 PD address\n");
 					dhcpv6_packet_free(reply);
 					return;
 				}
@@ -426,52 +433,61 @@ static void dhcpv6_send_reply(struct dhcpv6_packet *req, struct dhcpv6_pd *pd, i
 			} else if (!ses->ipv6_dp || list_empty(&ses->ipv6_dp->prefix_list) || f2) {
 				insert_status(reply, opt1, D6_STATUS_NoPrefixAvail);
 			} else {
+				int pd_install_ok = 1;
 
-				if (req->hdr->type == D6_REQUEST || req->rapid_commit) {
+				if (req->hdr->type == D6_REQUEST || req->rapid_commit)
 					pd->dp_iaid = ia_na->iaid;
-					if (!pd->dp_active)
-						insert_dp_routes(ses, pd, &req->addr.sin6_addr);
+
+				if (!pd->dp_active ||
+				    req->hdr->type == D6_RENEW ||
+				    req->hdr->type == D6_REBIND) {
+					if (insert_dp_routes(ses, pd, &req->addr.sin6_addr) != 0)
+						pd_install_ok = 0;
 				}
 
-				f2 = 1;
+				if (!pd_install_ok) {
+					insert_status(reply, opt1, D6_STATUS_NoPrefixAvail);
+				} else {
+					f2 = 1;
 
-				list_for_each_entry(a, &ses->ipv6_dp->prefix_list, entry) {
-					opt2 = dhcpv6_nested_option_alloc(reply, opt1, D6_OPTION_IAPREFIX, sizeof(*ia_prefix) - sizeof(struct dhcpv6_opt_hdr));
-					ia_prefix = (struct dhcpv6_opt_ia_prefix *)opt2->hdr;
+					list_for_each_entry(a, &ses->ipv6_dp->prefix_list, entry) {
+						opt2 = dhcpv6_nested_option_alloc(reply, opt1, D6_OPTION_IAPREFIX, sizeof(*ia_prefix) - sizeof(struct dhcpv6_opt_hdr));
+						ia_prefix = (struct dhcpv6_opt_ia_prefix *)opt2->hdr;
 
-					memcpy(&ia_prefix->prefix, &a->addr, sizeof(a->addr));
-					ia_prefix->prefix_len = a->prefix_len;
-					ia_prefix->pref_lifetime = htonl(conf_pref_lifetime);
-					ia_prefix->valid_lifetime = htonl(conf_valid_lifetime);
-				}
+						memcpy(&ia_prefix->prefix, &a->addr, sizeof(a->addr));
+						ia_prefix->prefix_len = a->prefix_len;
+						ia_prefix->pref_lifetime = htonl(conf_pref_lifetime);
+						ia_prefix->valid_lifetime = htonl(conf_valid_lifetime);
+					}
 
-				if (code == D6_REPLY) {
-					list_for_each_entry(opt2, &opt->opt_list, entry) {
-						if (ntohs(opt2->hdr->code) == D6_OPTION_IAPREFIX) {
-							ia_prefix = (struct dhcpv6_opt_ia_prefix *)opt2->hdr;
-							prefix = ia_prefix->prefix;
+					if (code == D6_REPLY) {
+						list_for_each_entry(opt2, &opt->opt_list, entry) {
+							if (ntohs(opt2->hdr->code) == D6_OPTION_IAPREFIX) {
+								ia_prefix = (struct dhcpv6_opt_ia_prefix *)opt2->hdr;
+								prefix = ia_prefix->prefix;
 
-							if (ia_prefix->prefix_len == 0 || IN6_IS_ADDR_UNSPECIFIED(&prefix))
-								continue;
-
-							f1 = 0;
-							list_for_each_entry(a, &ses->ipv6_dp->prefix_list, entry) {
-								if (a->prefix_len != ia_prefix->prefix_len)
+								if (ia_prefix->prefix_len == 0 || IN6_IS_ADDR_UNSPECIFIED(&prefix))
 									continue;
-								if (memcmp(&a->addr, &ia_prefix->prefix, sizeof(a->addr)))
-									continue;
-								f1 = 1;
-								break;
-							}
 
-							if (!f1) {
-								opt3 = dhcpv6_nested_option_alloc(reply, opt1, D6_OPTION_IAPREFIX, sizeof(*ia_prefix) - sizeof(struct dhcpv6_opt_hdr));
-								memcpy(opt3->hdr->data, opt2->hdr->data, sizeof(*ia_prefix) - sizeof(struct dhcpv6_opt_hdr));
-								ia_prefix = (struct dhcpv6_opt_ia_prefix *)opt3->hdr;
-								ia_prefix->pref_lifetime = 0;
-								ia_prefix->valid_lifetime = 0;
+								f1 = 0;
+								list_for_each_entry(a, &ses->ipv6_dp->prefix_list, entry) {
+									if (a->prefix_len != ia_prefix->prefix_len)
+										continue;
+									if (memcmp(&a->addr, &ia_prefix->prefix, sizeof(a->addr)))
+										continue;
+									f1 = 1;
+									break;
+								}
 
-								insert_status(reply, opt3, D6_STATUS_NotOnLink);
+								if (!f1) {
+									opt3 = dhcpv6_nested_option_alloc(reply, opt1, D6_OPTION_IAPREFIX, sizeof(*ia_prefix) - sizeof(struct dhcpv6_opt_hdr));
+									memcpy(opt3->hdr->data, opt2->hdr->data, sizeof(*ia_prefix) - sizeof(struct dhcpv6_opt_hdr));
+									ia_prefix = (struct dhcpv6_opt_ia_prefix *)opt3->hdr;
+									ia_prefix->pref_lifetime = 0;
+									ia_prefix->valid_lifetime = 0;
+
+									insert_status(reply, opt3, D6_STATUS_NotOnLink);
+								}
 							}
 						}
 					}
@@ -615,6 +631,7 @@ static void dhcpv6_send_reply2(struct dhcpv6_packet *req, struct dhcpv6_pd *pd, 
 			}
 
 			if (!ses->ipv6_dp)
+                log_error("dhcpv6: no free IPv6 PD address\n");
 				goto out;
 
 			f3 = 0;

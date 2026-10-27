@@ -13,6 +13,7 @@
 #include "ap_session_backup.h"
 
 #include "ipdb.h"
+#include "cli.h"
 
 #ifdef RADIUS
 #include "radius.h"
@@ -36,6 +37,7 @@ struct ippool_t
 	struct ippool_t *next;
 	generate_func generate;
 	spinlock_t lock;
+	uint32_t item_count;  /* O(1) count of available IPs, updated on get_ip/put_ip */
 };
 
 struct ippool_item_t
@@ -291,6 +293,7 @@ static void generate_pool_p2p(struct ippool_t *p)
 		it->it.peer_addr = peer_addr->addr;
 
 		list_add_tail(&it->entry, &p->items);
+		p->item_count++;
 	}
 }
 
@@ -328,6 +331,7 @@ static void generate_pool_net30(struct ippool_t *p)
 		it->it.peer_addr = addr[2]->addr;
 
 		list_add_tail(&it->entry, &p->items);
+		p->item_count++;
 
 		for (i = 0; i < 4; i++) {
 			if (addr[i])
@@ -361,6 +365,7 @@ static struct ipv4db_item_t *get_ip(struct ap_session *ses)
 		if (!list_empty(&pool->items)) {
 			it = list_entry(pool->items.next, typeof(*it), entry);
 			list_del(&it->entry);
+			pool->item_count--;
 		} else
 			it = NULL;
 		spin_unlock(&pool->lock);
@@ -388,6 +393,7 @@ static void put_ip(struct ap_session *ses, struct ipv4db_item_t *it)
 
 	spin_lock(&pit->pool->lock);
 	list_add_tail(&pit->entry, &pit->pool->items);
+	pit->pool->item_count++;
 	spin_unlock(&pit->pool->lock);
 }
 
@@ -438,6 +444,7 @@ static int session_restore(struct ap_session *ses, struct backup_mod *m)
 	list_for_each_entry(it, &def_pool->items, entry) {
 		if (peer_addr == it->it.peer_addr && addr == it->it.addr) {
 			list_del(&it->entry);
+			def_pool->item_count--;
 			it0 = it;
 			break;
 		}
@@ -450,6 +457,7 @@ static int session_restore(struct ap_session *ses, struct backup_mod *m)
 			list_for_each_entry(it, &p->items, entry) {
 				if (peer_addr == it->it.peer_addr && addr == it->it.addr) {
 					list_del(&it->entry);
+					p->item_count--;
 					it0 = it;
 					break;
 				}
@@ -612,6 +620,68 @@ static void ippool_init1(void)
 	ipdb_register(&ipdb);
 }
 
+/* Sum total and available across pool chain (pool->next for multi-range config).
+ * Each pool in the chain has its own lock - we lock per pool to avoid deadlock. */
+static void ippool_chain_totals(struct ippool_t *start, uint32_t *total, uint32_t *available)
+{
+    struct ippool_t *p = start;
+
+    *total = 0;
+    *available = 0;
+    do {
+        spin_lock(&p->lock);
+        if (p->startip && p->endip)
+            *total += p->endip - p->startip + 1;
+        *available += p->item_count;
+        spin_unlock(&p->lock);
+        p = p->next;
+    } while (p && p != start);
+}
+
+static int show_ippool_exec(const char *cmd, char * const *fields, int fields_cnt, void *client)
+{
+    struct ippool_t *pool;
+    uint32_t total, available, used;
+    uint32_t usage_pct;
+
+    cli_send(client, "pool_name,total,used,available,usage\r\n");
+
+    /* O(1) count via item_count; multi-range pools sum across pool->next chain */
+
+    /* Show default pool first */
+    if (def_pool) {
+        ippool_chain_totals(def_pool, &total, &available);
+        used = total - available;
+        usage_pct = (total > 0) ? (uint32_t)((uint64_t)used * 100 / total) : 0;
+
+        if (total > 0) {
+            cli_sendv(client, "<default>,%u,%u,%u,%u\r\n",
+                      total, used, available, usage_pct);
+        }
+    }
+
+    /* Show named pools */
+    list_for_each_entry(pool, &pool_list, entry) {
+        if (!pool->name) continue;
+
+        ippool_chain_totals(pool, &total, &available);
+        used = total - available;
+        usage_pct = (total > 0) ? (uint32_t)((uint64_t)used * 100 / total) : 0;
+
+        if (total > 0) {
+            cli_sendv(client, "%s,%u,%u,%u,%u\r\n",
+                      pool->name, total, used, available, usage_pct);
+        }
+    }
+
+    return CLI_CMD_OK;
+}
+
+static void show_ippool_help(char * const *fields, int fields_cnt, void *client)
+{
+    cli_send(client, "show ippool - shows IP pool statistics\r\n");
+}
+
 static void ippool_init2(void)
 {
 	struct conf_sect_t *s = conf_get_section("ip-pool");
@@ -676,6 +746,8 @@ static void ippool_init2(void)
 	if (triton_module_loaded("radius"))
 		triton_event_register_handler(EV_RADIUS_ACCESS_ACCEPT, (triton_event_func)ev_radius_access_accept);
 #endif
+
+    cli_register_simple_cmd2(show_ippool_exec, show_ippool_help, 2, "show", "ippool");
 }
 
 DEFINE_INIT(51, ippool_init1);

@@ -17,6 +17,37 @@
 
 void core_restart(int);
 
+static int show_stat_exec_yaml(const char *cmd, char * const *fields, int fields_cnt, void *client)
+{
+    struct timespec ts;
+    unsigned long dt;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    dt = ts.tv_sec - triton_stat.start_time;
+
+    cli_sendv(client, "uptime: %lu\r\n", dt);
+    cli_sendv(client, "cpu: %i\r\n", triton_stat.cpu);
+    cli_send(client, "core:\r\n");
+    cli_sendv(client, "     mempoolAllocated: %u\r\n", triton_stat.mempool_allocated);
+    cli_sendv(client, "     mempoolAvailable: %u\r\n", triton_stat.mempool_available);
+    cli_sendv(client, "     threadCount: %u\r\n", triton_stat.thread_count);
+    cli_sendv(client, "     threadActive: %u\r\n", triton_stat.thread_active);
+    cli_sendv(client, "     contextCount: %u\r\n", triton_stat.context_count);
+    cli_sendv(client, "     contextSleeping: %u\r\n", triton_stat.context_sleeping);
+    cli_sendv(client, "     contextPending: %u\r\n", triton_stat.context_pending);
+    cli_sendv(client, "     mdHandlerCount: %u\r\n", triton_stat.md_handler_count);
+    cli_sendv(client, "     mdHandlerPending: %u\r\n", triton_stat.md_handler_pending);
+    cli_sendv(client, "     timerCount: %u\r\n", triton_stat.timer_count);
+    cli_sendv(client, "     timerPending: %u\r\n", triton_stat.timer_pending);
+
+    cli_send(client, "sessions:\r\n");
+    cli_sendv(client, "     starting: %u\r\n", ap_session_stat.starting);
+    cli_sendv(client, "     active: %u\r\n", ap_session_stat.active);
+    cli_sendv(client, "     finishing: %u\r\n", ap_session_stat.finishing);
+
+    return CLI_CMD_OK;
+}
+
 static int show_stat_exec(const char *cmd, char * const *fields, int fields_cnt, void *client)
 {
 	struct timespec ts;
@@ -400,7 +431,8 @@ static void restart_help(char * const *fields, int fields_cnt, void *client)
 static void init(void)
 {
 	cli_register_simple_cmd2(show_stat_exec, show_stat_help, 2, "show", "stat");
-	cli_register_simple_cmd2(show_version_exec, show_version_help, 2, "show", "version");
+    cli_register_simple_cmd2(show_stat_exec_yaml, NULL, 2, "show", "stat_yaml");
+    cli_register_simple_cmd2(show_version_exec, show_version_help, 2, "show", "version");
 	cli_register_simple_cmd2(terminate_exec, terminate_help, 1, "terminate");
 	cli_register_simple_cmd2(reload_exec, reload_help, 1, "reload");
 	cli_register_simple_cmd2(restart_exec, restart_help, 1, "restart");

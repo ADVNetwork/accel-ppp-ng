@@ -85,6 +85,8 @@ struct ap_session
 	time_t stop_time;
 	time_t idle_time;
 	char *username;
+    char *realm;
+    int is_radius_auth;
 	struct ipv4db_item_t *ipv4;
 	struct ipv6db_item_t *ipv6;
 	struct ipv6db_prefix_t *ipv6_dp;

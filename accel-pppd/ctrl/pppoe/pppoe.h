@@ -139,6 +139,7 @@ struct monitored_link_list_entry_t {
 	struct list_head entry;
 	char *name;
 	char *opt;
+	void *re;  /* pcre2_code* - cached compiled regex for "re:pattern" entries, NULL for exact match */
 };
 extern struct list_head monitored_link_list;
 

@@ -692,7 +692,8 @@ static void ipv6cp_recv(struct ppp_handler_t*h)
 				ipv6cp->ld.passive = 0;
 				ppp_fsm_lower_up(&ipv6cp->fsm);
 				ppp_fsm_open(&ipv6cp->fsm);
-				triton_timer_del(&ipv6cp->timeout);
+                if (ipv6cp->timeout.tpd)
+                    triton_timer_del(&ipv6cp->timeout);
 			}
 			if (delay_ack && !ipv6cp->delay_ack)
 				__ipv6cp_layer_up(ipv6cp);

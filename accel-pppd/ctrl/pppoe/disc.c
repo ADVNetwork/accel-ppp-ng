@@ -16,6 +16,7 @@
 #include "mempool.h"
 
 #include "ap_net.h"
+#include "ap_session.h"
 #include "pppoe.h"
 
 #include "memdebug.h"
@@ -252,6 +253,7 @@ static void notify_down(struct disc_net *net, int ifindex)
 		else if (ifindex > n->ifindex)
 			p = &(*p)->rb_right;
 		else {
+			n->stop_cause = TERM_NAS_ERROR;
 			triton_context_call(&n->ctx, (triton_event_func)_server_stop, n);
 			break;
 		}

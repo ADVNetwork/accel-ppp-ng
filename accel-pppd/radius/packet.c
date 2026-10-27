@@ -215,7 +215,7 @@ int rad_packet_recv(int fd, struct rad_packet_t **p, struct sockaddr_in *addr)
 					goto out_err;
 				}
 			} else
-				log_ppp_warn("radius:packet: vendor %i not found\n", id);
+				log_ppp_warn("radius:packet: vendor %i not found\n", vendor_id);
 		} else
 			vendor = NULL;
 		da = rad_dict_find_attr_id(vendor, id);

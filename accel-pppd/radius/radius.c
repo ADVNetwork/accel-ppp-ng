@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <linux/if_link.h>
+#include <glib.h>
 
 #include "mempool.h"
 #include "events.h"
@@ -21,6 +22,8 @@
 #include "radius_p.h"
 #include "attr_defs.h"
 #include "config.h"
+
+#include "cli.h"
 
 #include "memdebug.h"
 
@@ -54,7 +57,7 @@ int conf_fail_time;
 int conf_req_limit;
 
 static const char *conf_default_realm;
-static int conf_default_realm_len;
+static int conf_force_realm;
 static int conf_strip_realm;
 
 const char *conf_attr_tunnel_type;
@@ -69,6 +72,8 @@ static struct ipdb_t ipdb;
 
 static mempool_t rpd_pool;
 static mempool_t auth_ctx_pool;
+
+GHashTable *realm_force_table;
 
 static void parse_framed_route(struct radius_pd_t *rpd, const char *attr)
 {
@@ -437,6 +442,41 @@ int rad_proc_attrs(struct rad_req_t *req)
 	return res;
 }
 
+const char *get_realm(struct ap_session *ses, const char *username)
+{
+    char *realm;
+
+    if (conf_force_realm){
+        char *find_name = malloc(strlen(username) + 1 + 3);
+        strcpy(find_name, "usr");
+        strcat(find_name, username);
+        if(g_hash_table_contains(realm_force_table, find_name)){
+            realm = g_hash_table_lookup(realm_force_table, find_name);
+            free(find_name);
+            return realm;
+        }
+        free(find_name);
+
+        if (ses->ctrl){
+            char *find_sid = malloc(strlen(username) + 1 + 3);
+            strcpy(find_sid, "sid");
+            strcat(find_sid, ses->ctrl->called_station_id);
+            if(g_hash_table_contains(realm_force_table, find_sid)){
+                realm = g_hash_table_lookup(realm_force_table, find_sid);
+                free(find_sid);
+                return realm;
+            }
+            free(find_sid);
+        }
+    }
+
+    if(conf_default_realm){
+        return conf_default_realm;
+    }
+
+    return NULL;
+}
+
 static int rad_pwdb_check(struct pwdb_t *pwdb, struct ap_session *ses, pwdb_callback cb, void *cb_arg, const char *username, int type, va_list _args)
 {
 	int r = PWDB_NO_IMPL;
@@ -444,34 +484,38 @@ static int rad_pwdb_check(struct pwdb_t *pwdb, struct ap_session *ses, pwdb_call
 	int chap_type;
 	struct radius_pd_t *rpd = find_pd(ses);
 	char username1[256];
+    char const *realm;
 
 	if (!rpd) {
 		log_emerg("radius:%s:BUG: rpd not found\n", __func__);
 		abort();
 	}
 
-	if (conf_strip_realm || conf_default_realm) {
-		int len = strchrnul(username, '@') - username;
-		if (conf_strip_realm && username[len]) {
-			if (len > sizeof(username1) - 1) {
-				log_ppp_error("radius: username is too large to strip realm\n");
-				return PWDB_DENIED;
-			}
-			username = memcpy(username1, username, len);
-			username1[len] = '\0';
-		}
-		if (conf_default_realm && username[len] == '\0') {
-			if (len + conf_default_realm_len > sizeof(username1) - 2) {
-				log_ppp_error("radius: username is too large to append realm\n");
-				return PWDB_DENIED;
-			}
-			if (username != username1)
-				username = memcpy(username1, username, len);
-			username1[len++] = '@';
-			memcpy(username1 + len, conf_default_realm, conf_default_realm_len);
-			username1[len + conf_default_realm_len] = '\0';
-		}
-	}
+    realm = get_realm(ses, username);
+    if(realm){
+        if (ses->realm) {
+            /* Free the previous copy before overwriting */
+            _free(ses->realm);
+            ses->realm = NULL;
+        }
+
+        log_ppp_info2("radius: apply realm %s to user %s\n", realm, username);
+        /* Store a _strdup copy: realm_force_table owns the original and
+         * 'realm change remove' can g_free() it while this session is active. */
+        ses->realm = _strdup(realm);
+    }
+
+    if (conf_strip_realm) {
+        int len = strchrnul(username, '@') - username;
+        if (username[len]) {
+            if (len > sizeof(username1) - 1) {
+                log_ppp_error("radius: username is too large to strip realm\n");
+                return PWDB_DENIED;
+            }
+            username = memcpy(username1, username, len);
+            username1[len] = '\0';
+        }
+    }
 
 	rpd->auth_ctx = mempool_alloc(auth_ctx_pool);
 	memset(rpd->auth_ctx, 0, sizeof(*rpd->auth_ctx));
@@ -1013,6 +1057,81 @@ static int parse_server(const char *opt, in_addr_t *addr, int *port, char **secr
 	return 0;
 }
 
+static int add_realm(char *ident, char *realm){
+    int count = 0;
+    char *range = strrchr(ident, '.');
+    if (range != NULL) {
+        range++;
+
+        char *hash = strrchr(range, '-');
+        if (hash != NULL) {
+            int start = atoi(strsep(&range, "-"));
+            int end = atoi(strsep(&range, "-"));
+
+            range = strrchr(ident, '.') + 1;
+            *range = '\0';
+
+            if (end != 0 && start != 0 && end >= start) {
+                for (int i = start; i <= end; i++) {
+                    char new_ident[30];
+
+                    snprintf(new_ident, 30, "%s%i", ident, i);
+
+                    g_hash_table_insert(realm_force_table, g_strdup(new_ident), g_strdup(realm));
+                    count ++;
+                }
+            }
+        } else {
+            g_hash_table_insert(realm_force_table, g_strdup(ident), g_strdup(realm));
+            count ++;
+        }
+    } else {
+        g_hash_table_insert(realm_force_table, g_strdup(ident), g_strdup(realm));
+        count ++;
+    }
+
+    return count;
+}
+
+static int load_realm_config(void){
+    g_hash_table_remove_all(realm_force_table);
+
+    if (conf_force_realm) {
+        struct conf_sect_t *s = conf_get_section("radius");
+        struct conf_option_t *opt1;
+        list_for_each_entry(opt1, &s->items, entry) {
+            if (strcmp(opt1->name, "force-realm-item") || !opt1->val)
+                continue;
+
+            /* strsep() advances the pointer it receives; save the original
+             * so we can free the correct start address of the allocation. */
+            char *optValue_base = _malloc(strlen(opt1->val) + 1);
+            if (!optValue_base)
+                continue;
+            char *optValue = optValue_base;
+            memcpy(optValue, opt1->val, strlen(opt1->val) + 1);
+
+            char *ident = strsep(&optValue, ":");
+            if ((ident == NULL) || (ident[0] == '\0')) {
+                _free(optValue_base);
+                continue;
+            }
+
+            char *realm = strsep(&optValue, ":");
+            if ((realm == NULL) || (realm[0] == '\0')) {
+                _free(optValue_base);
+                continue;
+            }
+
+            add_realm(ident, realm);
+
+            _free(optValue_base);
+        }
+    }
+
+    return 0;
+}
+
 static int load_config(void)
 {
 	char *opt;
@@ -1088,8 +1207,6 @@ static int load_config(void)
 	conf_attr_tunnel_type = conf_get_opt("radius", "attr-tunnel-type");
 
 	conf_default_realm = conf_get_opt("radius", "default-realm");
-	if (conf_default_realm)
-		conf_default_realm_len = strlen(conf_default_realm);
 
 	opt = conf_get_opt("radius", "strip-realm");
 	if (opt && atoi(opt) >= 0)
@@ -1098,6 +1215,12 @@ static int load_config(void)
 	opt = conf_get_opt("radius", "nas-port-id-in-req");
 	if (opt)
 		conf_nas_port_id_in_req = atoi(opt);
+
+    opt = conf_get_opt("radius", "force-realm");
+    if (opt && atoi(opt) >= 0)
+        conf_force_realm = atoi(opt) > 0;
+
+    load_realm_config();
 
 	opt = conf_get_opt("radius", "acct-delay-start");
 	if (opt)
@@ -1108,10 +1231,80 @@ static int load_config(void)
 	return 0;
 }
 
+static int realm_show_exec(const char *cmd, char * const *f, int f_cnt, void *cli)
+{
+    log_ppp_debug("Radius: Realm show start\n");
+    if(!conf_force_realm){
+        cli_send(cli, "Realm not enabled\r\n");
+        log_ppp_debug("Radius: Realm not enabled\n");
+        return CLI_CMD_OK;
+    }
+
+    int count = 0;
+
+    cli_send(cli, "Realm\r\n");
+
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, realm_force_table);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        cli_sendv(cli, "Key: %s, Realm: %s\r\n", (char*)key, (char*)value);
+        count ++;
+    }
+
+    cli_sendv(cli, "Total Keys: %i\r\n", count);
+
+    log_ppp_debug("Radius: Realm show finish\n");
+    return CLI_CMD_OK;
+}
+
+static int realm_change_exec(const char *cmd, char * const *f, int f_cnt, void *cli)
+{
+    log_ppp_debug("Radius: Realm change start\n");
+
+    if(!conf_force_realm){
+        cli_send(cli, "Realm not enabled\r\n");
+        log_ppp_debug("Radius: Realm not enabled\n");
+        return CLI_CMD_OK;
+    }
+
+    char *command = f[2];
+
+    if(command == NULL){
+        log_ppp_debug("Radius: Realm change command NULL\n");
+        return CLI_CMD_SYNTAX;
+    }else if (strcmp(command, "remove_all") == 0){
+        g_hash_table_remove_all(realm_force_table);
+        log_ppp_debug("Radius: Realm change remove all\n");
+        return CLI_CMD_OK;
+    }else if (strcmp(command, "remove") == 0) {
+        if(f[3] != NULL) {
+            if(g_hash_table_remove(realm_force_table, f[3])){
+                cli_send(cli, "Key removed\r\n");
+            }else{
+                cli_send(cli, "key not found\r\n");
+            }
+        }
+        log_ppp_debug("Radius: Realm change key removed\n");
+        return CLI_CMD_OK;
+    }else if (strcmp(command, "add") == 0){
+        if(f[3] != NULL && f[4] != NULL){
+            cli_sendv(cli, "Added domains: %i\r\n", add_realm(f[3], f[4]));
+        }
+
+        log_ppp_debug("Radius: Realm change key add\n");
+        return CLI_CMD_OK;
+    }else {
+        log_ppp_debug("Radius: Realm change invalid\n");
+        return CLI_CMD_INVAL;
+    }
+}
+
 static void radius_init(void)
 {
 	const char *dict = NULL;
 	struct conf_sect_t *s = conf_get_section("radius");
+    realm_force_table = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 
 	if (!s) {
 		log_emerg("radius: config section not found\n");
@@ -1153,6 +1346,9 @@ static void radius_init(void)
 	triton_event_register_handler(EV_SES_FINISHED, (triton_event_func)ses_finished);
 	triton_event_register_handler(EV_FORCE_INTERIM_UPDATE, (triton_event_func)force_interim_update);
 	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
+
+    cli_register_simple_cmd2(realm_change_exec, NULL, 2, "realm", "change");
+    cli_register_simple_cmd2(realm_show_exec, NULL, 2, "realm", "show");
 }
 
 DEFINE_INIT(51, radius_init);

@@ -76,8 +76,23 @@ static struct rad_req_t *__rad_req_alloc(struct radius_pd_t *rpd, int code, cons
 	if (code == CODE_ACCOUNTING_REQUEST && rpd->acct_username)
 		username = rpd->acct_username;
 
-	if (rad_packet_add_str(req->pack, NULL, "User-Name", username))
-		goto out_err;
+    if(rpd->ses->realm){
+        size_t new_name_len = strlen(username) + strlen(rpd->ses->realm) + 2;
+        char *new_name = _malloc(new_name_len);
+        if (!new_name)
+            goto out_err;
+        snprintf(new_name, new_name_len, "%s@%s", username, rpd->ses->realm);
+
+        if (rad_packet_add_str(req->pack, NULL, "User-Name", new_name)){
+            _free(new_name);
+            goto out_err;
+        }
+
+        _free(new_name);
+    }else{
+        if (rad_packet_add_str(req->pack, NULL, "User-Name", username))
+            goto out_err;
+    }
 
 	if (conf_nas_identifier)
 		if (rad_packet_add_str(req->pack, NULL, "NAS-Identifier", conf_nas_identifier))

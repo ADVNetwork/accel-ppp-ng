@@ -12,6 +12,7 @@
 #include "list.h"
 
 struct ap_session;
+struct rtnl_link_stats64;
 /*
  * Hooks are presented mostly for VPP and are designed
  * to present the VPP routine as a separate plugin.
@@ -32,6 +33,13 @@ struct ap_session_hooks_t {
 	 */
 	int (*pppoe_create_session_interface)(struct ap_session *ses);
 	int (*pppoe_terminate)(struct ap_session *ses, int hard);
+	/* optional stats hook for non-kernel interfaces */
+	int (*read_stats)(struct ap_session *ses, struct rtnl_link_stats64 *stats);
+	/* optional bulk stats hooks (per command) */
+	int (*stats_batch_set_filter)(const uint32_t *if_indices, size_t count);
+	int (*stats_batch_begin)(void);
+	void (*stats_batch_end)(void);
+	int (*get_sw_if_index)(struct ap_session *ses, uint32_t *sw_if_index);
 
 	/* route related hooks called from accel_iputils */
 	int (*ipaddr_add)(struct ap_session *ses, int ifindex, in_addr_t addr, int mask);

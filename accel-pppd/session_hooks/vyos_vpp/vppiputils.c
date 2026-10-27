@@ -5,6 +5,7 @@
 */
 
 #include <vapi/ip.api.vapi.h>
+#include <unistd.h>
 
 #include "ap_session.h"
 #include "triton.h"
@@ -85,20 +86,136 @@ static void vpp_ip6route_del_saved(struct ap_session *ses, const struct in6_addr
 	}
 }
 
-static vapi_error_e vpp_ip_ro_cb(struct vapi_ctx_s *ctx,
-								 void *callback_ctx,
-								 vapi_error_e rv,
-								 bool is_last,
-								 vapi_payload_ip_route_add_del_reply *reply)
+typedef struct vpp_ip_route_lookup_ctx_t {
+	int32_t api_retval;
+	uint32_t sw_if_index;
+	int found;
+} vpp_ip_route_lookup_ctx_t;
+
+static vapi_error_e vpp_ip_route_lookup_cb(struct vapi_ctx_s *ctx,
+					 void *callback_ctx,
+					 vapi_error_e rv,
+					 bool is_last,
+					 vapi_payload_ip_route_lookup_reply *reply)
 {
+	vpp_ip_route_lookup_ctx_t *lookup_ctx = callback_ctx;
+
+	if (rv != VAPI_OK || !reply || !lookup_ctx)
+		return rv;
+
+	lookup_ctx->api_retval = reply->retval;
+	if (lookup_ctx->api_retval != 0 || reply->route.n_paths == 0)
+		return rv;
+
+	/* Route present: exact /32 lookup succeeded with at least one path.
+	 * Do not index reply->route.paths[] — VAPI flex-array layout is unreliable. */
+	lookup_ctx->found = 1;
+
 	return rv;
 }
 
-static int vpp_iproute(int is_add, int ifindex,
-								 in_addr_t dst, int mask)
+int vpp_ip4_host_route_present(uint32_t sw_if_index, in_addr_t dst)
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
+	vpp_ip_route_lookup_ctx_t lookup_ctx = {
+		.api_retval = -1,
+		.sw_if_index = sw_if_index,
+		.found = 0,
+	};
+
+	vpp_lock();
+
+	ctx = vpp_get_vapi();
+	if (ctx == NULL)
+		goto exit;
+
+	vapi_msg_ip_route_lookup *req = vapi_alloc_ip_route_lookup(ctx);
+	if (req == NULL)
+		goto exit;
+
+	req->payload.table_id = 0;
+	req->payload.exact = 1;
+	req->payload.prefix.address.af = ADDRESS_IP4;
+	memcpy(req->payload.prefix.address.un.ip4, &dst, sizeof(dst));
+	req->payload.prefix.len = 32;
+
+	err = vapi_ip_route_lookup(ctx, req, vpp_ip_route_lookup_cb, &lookup_ctx);
+	vpp_check_error(err);
+
+exit:
+	vpp_unlock();
+
+	if (err != VAPI_OK)
+		return -1;
+
+	/* Missing exact route: VPP often returns api_retval != 0 (e.g. NO_SUCH_ENTRY)
+	 * with found still 0 — must be 0 (absent), not -1, or the route watchdog skips. */
+	return lookup_ctx.found ? 1 : 0;
+}
+
+int vpp_ip6_prefix_route_present(uint32_t sw_if_index, const struct in6_addr *dst,
+				 int prefix_len)
+{
+	vapi_error_e err = -1;
+	struct vapi_ctx_s *ctx;
+	vpp_ip_route_lookup_ctx_t lookup_ctx = {
+		.api_retval = -1,
+		.sw_if_index = sw_if_index,
+		.found = 0,
+	};
+
+	if (!dst || prefix_len <= 0 || prefix_len > 128)
+		return -1;
+
+	vpp_lock();
+
+	ctx = vpp_get_vapi();
+	if (ctx == NULL)
+		goto exit;
+
+	vapi_msg_ip_route_lookup *req = vapi_alloc_ip_route_lookup(ctx);
+	if (req == NULL)
+		goto exit;
+
+	req->payload.table_id = 0;
+	req->payload.exact = 1;
+	req->payload.prefix.address.af = ADDRESS_IP6;
+	memcpy(req->payload.prefix.address.un.ip6, dst, sizeof(*dst));
+	req->payload.prefix.len = prefix_len;
+
+	err = vapi_ip_route_lookup(ctx, req, vpp_ip_route_lookup_cb, &lookup_ctx);
+	vpp_check_error(err);
+
+exit:
+	vpp_unlock();
+
+	if (err != VAPI_OK)
+		return -1;
+
+	return lookup_ctx.found ? 1 : 0;
+}
+
+static vapi_error_e vpp_ip_ro_cb(struct vapi_ctx_s *ctx,
+				 void *callback_ctx,
+				 vapi_error_e rv,
+				 bool is_last,
+				 vapi_payload_ip_route_add_del_reply *reply)
+{
+	struct vpp_vapi_reply_ctx *reply_ctx = callback_ctx;
+
+	if (rv == VAPI_OK && reply_ctx && reply)
+		reply_ctx->api_retval = reply->retval;
+
+	return rv;
+}
+
+static int vpp_iproute(int is_add, int ifindex, in_addr_t dst, int mask)
+{
+	vapi_error_e err = -1;
+	struct vapi_ctx_s *ctx;
+	struct vpp_vapi_reply_ctx reply_ctx = { 0, NULL };
+	int attempt;
 
 	vpp_lock();
 
@@ -107,20 +224,28 @@ static int vpp_iproute(int is_add, int ifindex,
 		goto exit;
 	}
 
-	vapi_msg_ip_route_add_del *req = vapi_alloc_ip_route_add_del(ctx, 1);
-	if (req == NULL) {
-		goto exit;
+	for (attempt = 0; attempt < 3; attempt++) {
+		vapi_msg_ip_route_add_del *req = vapi_alloc_ip_route_add_del(ctx, 1);
+		if (req == NULL) {
+			goto exit;
+		}
+
+		reply_ctx.api_retval = 0;
+		req->payload.is_add = is_add;
+		req->payload.is_multipath = 0;
+		req->payload.route.prefix.address.af = ADDRESS_IP4;
+		memcpy(req->payload.route.prefix.address.un.ip4, &dst, sizeof(dst));
+		req->payload.route.prefix.len = mask;
+		req->payload.route.paths[0].sw_if_index = ifindex;
+
+		err = vapi_ip_route_add_del(ctx, req, vpp_ip_ro_cb, &reply_ctx);
+		vpp_check_error(err);
+		err = vpp_vapi_errno(err, &reply_ctx);
+		if (err == 0 || !is_add)
+			break;
+
+		usleep(2000 * (attempt + 1));
 	}
-
-	req->payload.is_add = is_add;
-	req->payload.is_multipath = 0;
-	req->payload.route.prefix.address.af = ADDRESS_IP4;
-	memcpy(req->payload.route.prefix.address.un.ip4, &dst, sizeof(dst));
-	req->payload.route.prefix.len = mask;
-	req->payload.route.paths[0].sw_if_index = ifindex;
-
-	err = vapi_ip_route_add_del(ctx, req, vpp_ip_ro_cb, NULL);
-	vpp_check_error(err);
 
 exit:
 	vpp_unlock();
@@ -128,22 +253,40 @@ exit:
 }
 
 int vpp_iproute_add_del(struct ap_session *ses, int is_add, int ifindex, in_addr_t src,
-								 in_addr_t dst, in_addr_t gw, int proto, int mask, uint32_t prio)
+			in_addr_t dst, in_addr_t gw, int proto, int mask, uint32_t prio)
 {
 	int ret = vpp_iproute(is_add, ifindex, dst, mask);
 
-	if (is_add)
-		vpp_iproute_save(ses, dst, mask);
-	else
+	if (is_add) {
+		if (ret == 0)
+			vpp_iproute_save(ses, dst, mask);
+	} else if (ret == 0) {
 		vpp_iproute_del_saved(ses, dst, mask);
+	}
 
 	return ret;
 }
 
+static vapi_error_e vpp_ip6_ro_cb(struct vapi_ctx_s *ctx,
+				  void *callback_ctx,
+				  vapi_error_e rv,
+				  bool is_last,
+				  vapi_payload_ip_route_add_del_reply *reply)
+{
+	struct vpp_vapi_reply_ctx *reply_ctx = callback_ctx;
+
+	if (rv == VAPI_OK && reply_ctx && reply)
+		reply_ctx->api_retval = reply->retval;
+
+	return rv;
+}
+
 static int vpp_ip6route(int is_add, int ifindex, const struct in6_addr *dst, int pref_len)
 {
-	vapi_error_e err = -1;;
+	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
+	struct vpp_vapi_reply_ctx reply_ctx = { 0, NULL };
+	int attempt;
 
 	vpp_lock();
 
@@ -152,20 +295,28 @@ static int vpp_ip6route(int is_add, int ifindex, const struct in6_addr *dst, int
 		goto exit;
 	}
 
-	vapi_msg_ip_route_add_del *req = vapi_alloc_ip_route_add_del(ctx, 1);
-	if (req == NULL) {
-		goto exit;
+	for (attempt = 0; attempt < 3; attempt++) {
+		vapi_msg_ip_route_add_del *req = vapi_alloc_ip_route_add_del(ctx, 1);
+		if (req == NULL) {
+			goto exit;
+		}
+
+		reply_ctx.api_retval = 0;
+		req->payload.is_add = is_add;
+		req->payload.is_multipath = 0;
+		req->payload.route.prefix.address.af = ADDRESS_IP6;
+		memcpy(req->payload.route.prefix.address.un.ip6, dst, sizeof(*dst));
+		req->payload.route.prefix.len = pref_len;
+		req->payload.route.paths[0].sw_if_index = ifindex;
+
+		err = vapi_ip_route_add_del(ctx, req, vpp_ip6_ro_cb, &reply_ctx);
+		vpp_check_error(err);
+		err = vpp_vapi_errno(err, &reply_ctx);
+		if (err == 0 || !is_add)
+			break;
+
+		usleep(2000 * (attempt + 1));
 	}
-
-	req->payload.is_add = is_add;
-	req->payload.is_multipath = 0;
-	req->payload.route.prefix.address.af = ADDRESS_IP6;
-	memcpy(req->payload.route.prefix.address.un.ip6, dst, sizeof(*dst));
-	req->payload.route.prefix.len = pref_len;
-	req->payload.route.paths[0].sw_if_index = ifindex;
-
-	err = vapi_ip_route_add_del(ctx, req, vpp_ip_ro_cb, NULL);
-	vpp_check_error(err);
 
 exit:
 	vpp_unlock();
@@ -176,10 +327,16 @@ int vpp_ip6route_add_del(struct ap_session *ses, int is_add, int ifindex, const 
 {
 	int ret = vpp_ip6route(is_add, ifindex, dst, pref_len);
 
-	if (is_add)
-		vpp_ip6route_save(ses, dst, pref_len);
-	else
+	if (is_add && ret != 0 &&
+	    vpp_ip6_prefix_route_present(ifindex, dst, pref_len) == 1)
+		ret = 0;
+
+	if (is_add) {
+		if (ret == 0)
+			vpp_ip6route_save(ses, dst, pref_len);
+	} else if (ret == 0) {
 		vpp_ip6route_del_saved(ses, dst, pref_len);
+	}
 
 	return ret;
 }

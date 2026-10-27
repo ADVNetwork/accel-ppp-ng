@@ -226,6 +226,7 @@ static void ipoe_serv_timeout(struct triton_timer_t *t);
 static struct ipoe_session *ipoe_session_create_up(struct ipoe_serv *serv, struct ethhdr *eth, struct iphdr *iph, struct _arphdr *arph);
 static void __terminate(struct ap_session *ses);
 static void ipoe_ipv6_disable(struct ipoe_serv *serv);
+static void load_vlan_mon(struct conf_sect_t *sect);
 
 static void ipoe_ctx_switch(struct triton_context_t *ctx, void *arg)
 {
@@ -2650,30 +2651,42 @@ static void ipoe_serv_release(struct ipoe_serv *serv)
 	if (!serv->opt_auto)
 		ipoe_nl_del_interface(serv->ifindex);
 
-	if (serv->vlan_mon && conf_vlan_timeout) {
-		log_info2("ipoe: remove vlan %s\n", serv->ifname);
-		iplink_vlan_del(serv->ifindex);
-		vlan_mon_add_vid(serv->parent_ifindex, ETH_P_IP, serv->vid);
-	}
+    if (serv->vlan_mon && conf_vlan_timeout) {
+        log_info2("ipoe: remove vlan %s\n", serv->ifname);
+        iplink_vlan_del(serv->ifindex);
+
+        if (ap_shutdown){
+            vlan_mon_add_vid(serv->parent_ifindex, ETH_P_IP, serv->vid);
+        }else{
+            struct conf_sect_t *s = conf_get_section("ipoe");
+            if (s)
+                load_vlan_mon(s);
+        }
+    }
 
 	triton_context_unregister(&serv->ctx);
 
 	_free(serv);
 }
 
+static void ipoe_serv_close_2(struct ipoe_serv *serv)
+{
+    pthread_mutex_lock(&serv->lock);
+    serv->need_close = 1;
+    if (!list_empty(&serv->sessions)) {
+        pthread_mutex_unlock(&serv->lock);
+        return;
+    }
+    pthread_mutex_unlock(&serv->lock);
+
+    ipoe_serv_release(serv);
+}
+
 static void ipoe_serv_close(struct triton_context_t *ctx)
 {
-	struct ipoe_serv *serv = container_of(ctx, typeof(*serv), ctx);
+    struct ipoe_serv *serv = container_of(ctx, typeof(*serv), ctx);
 
-	pthread_mutex_lock(&serv->lock);
-	serv->need_close = 1;
-	if (!list_empty(&serv->sessions)) {
-		pthread_mutex_unlock(&serv->lock);
-		return;
-	}
-	pthread_mutex_unlock(&serv->lock);
-
-	ipoe_serv_release(serv);
+    ipoe_serv_close_2(serv);
 }
 
 static void l4_redirect_ctx_close(struct triton_context_t *ctx)
@@ -2701,6 +2714,16 @@ static void l4_redirect_ctx_close(struct triton_context_t *ctx)
 		triton_timer_del(&l4_redirect_timer);
 
 	triton_context_unregister(&l4_redirect_ctx);
+}
+
+static int show_stat_exec_yaml(const char *cmd, char * const *fields, int fields_cnt, void *client)
+{
+    cli_send(client, "ipoe:\r\n");
+    cli_sendv(client,"     starting: %u\r\n", stat_starting);
+    cli_sendv(client,"     active: %u\r\n", stat_active);
+    cli_sendv(client,"     delayed: %u\r\n", stat_delayed_offer);
+
+    return CLI_CMD_OK;
 }
 
 static int show_stat_exec(const char *cmd, char * const *fields, int fields_cnt, void *client)
@@ -4164,6 +4187,90 @@ static struct triton_timer_t l4_redirect_timer = {
 	.expire = l4_redirect_list_timer,
 };
 
+static void show_interfaces(void *cli)
+{
+    struct ipoe_serv *serv;
+
+    cli_send(cli, "interface:   connections:    state:   Vlan Mon:\r\n");
+    cli_send(cli, "-----------------------------------------------\r\n");
+
+    pthread_mutex_lock(&serv_lock);
+    list_for_each_entry(serv, &serv_list, entry) {
+        cli_sendv(cli, "%9s    %11u    %6s    %9s\r\n", serv->ifname, serv->sess_cnt, serv->active ? "active" : "stop", serv->vlan_mon? "Yes": "No");
+    }
+    pthread_mutex_unlock(&serv_lock);
+}
+
+static void show_interfaces_csv(void *cli)
+{
+    struct ipoe_serv *serv;
+
+    cli_send(cli, "interface,connections,state,vlan_mon\r\n");
+
+    pthread_mutex_lock(&serv_lock);
+    list_for_each_entry(serv, &serv_list, entry) {
+        cli_sendv(cli, "%s,%u,%i,%i\r\n", serv->ifname, serv->sess_cnt, serv->active, serv->vlan_mon);
+    }
+    pthread_mutex_unlock(&serv_lock);
+}
+
+void ipoe_server_start(const char *opt, void *cli)
+{
+    char name[IFNAMSIZ];
+    const char *ptr;
+
+    if (strlen(opt) > 3 && memcmp(opt, "re:", 3) == 0) {
+        load_interface_re(opt);
+        return;
+    }
+
+    load_interface(opt);
+}
+
+struct ipoe_serv *find_serv_by_ifname(const char *ifname) {
+    struct ipoe_serv *serv;
+    pthread_mutex_lock(&serv_lock);
+    list_for_each_entry(serv, &serv_list, entry) {
+        if (strcmp(serv->ifname, ifname) == 0) {
+            pthread_mutex_unlock(&serv_lock);
+            return serv;
+        }
+    }
+    pthread_mutex_unlock(&serv_lock);
+    return NULL;
+}
+
+void close_serv_by_ifname(const char *ifname) {
+    struct ipoe_serv *serv = find_serv_by_ifname(ifname);
+    if (serv) {
+        log_error("Serv %s Stop Start\n", ifname);
+        ipoe_serv_close_2(serv);
+        ipoe_drop_sessions(serv, NULL);
+    } else {
+        log_error("Server with interface name %s not found.\n", ifname);
+    }
+}
+
+static int intf_exec(const char *cmd, char * const *fields, int fields_cnt, void *client)
+{
+    if (fields_cnt == 3) {
+        if (!strcmp(fields[2], "show"))
+            show_interfaces(client);
+
+        if (!strcmp(fields[2], "show_csv"))
+            show_interfaces_csv(client);
+
+        return CLI_CMD_OK;
+    }
+
+    if (!strcmp(fields[2], "add"))
+        ipoe_server_start(fields[3], client);
+    else if (!strcmp(fields[2], "del"))
+        close_serv_by_ifname(fields[3]);
+
+    return CLI_CMD_OK;
+}
+
 static void ipoe_init(void)
 {
 	ses_pool = mempool_create(sizeof(struct ipoe_session));
@@ -4181,6 +4288,8 @@ static void ipoe_init(void)
 		ipset_flush(conf_l4_redirect_ipset);
 
 	cli_register_simple_cmd2(show_stat_exec, NULL, 2, "show", "stat");
+    cli_register_simple_cmd2(show_stat_exec_yaml, NULL, 2, "show", "stat_yaml");
+    cli_register_simple_cmd2(intf_exec, NULL, 2, "ipoe", "interface");
 	cli_show_ses_register("ipoe-type", "IPoE session type", print_session_type);
 
 	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);

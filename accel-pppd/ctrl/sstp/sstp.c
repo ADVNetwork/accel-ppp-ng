@@ -2737,6 +2737,15 @@ static void ev_ses_authorized(struct ap_session *ses)
 	}
 }
 
+static int show_stat_exec_yaml(const char *cmd, char * const *fields, int fields_cnt, void *client)
+{
+    cli_send(client, "sstp:\r\n");
+    cli_sendv(client,"     starting: %u\r\n", stat_starting);
+    cli_sendv(client,"     active: %u\r\n", stat_active);
+
+    return CLI_CMD_OK;
+}
+
 static int show_stat_exec(const char *cmd, char * const *fields, int fields_cnt, void *client)
 {
 	cli_send(client, "sstp:\r\n");
@@ -2957,8 +2966,9 @@ static void sstp_init(void)
 	triton_context_wakeup(&serv.ctx);
 
 	cli_register_simple_cmd2(show_stat_exec, NULL, 2, "show", "stat");
+    cli_register_simple_cmd2(show_stat_exec_yaml, NULL, 2, "show", "stat_yaml");
 
-	triton_event_register_handler(EV_MPPE_KEYS, (triton_event_func)ev_mppe_keys);
+    triton_event_register_handler(EV_MPPE_KEYS, (triton_event_func)ev_mppe_keys);
 	triton_event_register_handler(EV_SES_AUTHORIZED, (triton_event_func)ev_ses_authorized);
 	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
 	return;

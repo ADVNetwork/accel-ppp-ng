@@ -11,6 +11,7 @@
 #include <net/ethernet.h>
 #include <netpacket/packet.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #ifdef HAVE_PRINTF_H
 #include <printf.h>
 #endif
@@ -153,6 +154,7 @@ static int init_secret(struct pppoe_serv_t *serv);
 static void __pppoe_server_start(const char *ifname, const char *opt, void *cli, int parent_ifindex, int vid, int vlan_mon);
 static void pppoe_serv_timeout(struct triton_timer_t *t);
 static void set_vlan_timeout(struct pppoe_serv_t *serv);
+static void load_vlan_mon(struct conf_sect_t *sect);
 
 static void pppoe_serv_start_timer(struct pppoe_serv_t *serv)
 {
@@ -237,9 +239,8 @@ int pppoe_terminate(struct ap_session *ses, int hard) {
 	int ret = 0;
 
 #ifdef HAVE_SESSION_HOOKS
-	if (ses->hooks && ses->hooks->pppoe_terminate &&
-		ses->hooks->pppoe_terminate(ses, hard))
-		log_ppp_warn("pppoe: issue to terminate PPPoE session with hook\n");
+	if (ses->hooks && ses->hooks->pppoe_terminate)
+		ses->hooks->pppoe_terminate(ses, hard);
 #endif /* HAVE_SESSION_HOOKS */
 
 	ret = ppp_terminate(ses, hard);
@@ -1276,6 +1277,12 @@ static void pppoe_recv_PADR(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 		}
 	}
 
+    if (!service_name_tag){
+        if (conf_verbose)
+            log_warn("pppoe: discard PADR packet (no Service-Name tag present)\n");
+        return;
+    }
+
 	if (!ac_cookie_tag) {
 		if (conf_verbose)
 			log_warn("pppoe: discard PADR packet (no AC-Cookie tag present)\n");
@@ -1509,6 +1516,12 @@ void pppoe_server_start(const char *opt, void *cli)
 	const char *ptr;
 
 	if (strlen(opt) > 3 && memcmp(opt, "re:", 3) == 0) {
+		/* Registrar a entrada regex para novos links futuros */
+		pthread_rwlock_wrlock(&serv_lock);
+		monitored_link_list_add(opt, opt);
+		pthread_rwlock_unlock(&serv_lock);
+
+		/* Iniciar serviços em interfaces existentes que batem nesse regex */
 		pppoe_add_interface_re(opt, cli);
 		return;
 	}
@@ -1716,7 +1729,14 @@ out_err:
 
 static void _conn_stop(struct pppoe_conn_t *conn)
 {
-	ap_session_terminate(&conn->ppp.ses, conn->serv->stop_cause, 0);
+	/* Use hard termination only when the interface is confirmed deleted.
+	 * if_nametoindex()==0 means the netdevice is gone (RTM_DELLINK): send()
+	 * would fail with ENODEV anyway, so skip the 3-6s LCP Term-Ack wait.
+	 * For IF_OPER_DOWN the interface still exists; hard=1 would terminate
+	 * sessions that could survive a brief carrier flap (e.g. 50 ms flap). */
+	int hard = (conn->serv->stop_cause == TERM_NAS_ERROR &&
+	            if_nametoindex(conn->serv->ifname) == 0) ? 1 : 0;
+	ap_session_terminate(&conn->ppp.ses, conn->serv->stop_cause, hard);
 }
 
 void _server_stop(struct pppoe_serv_t *serv)
@@ -1759,7 +1779,13 @@ void pppoe_server_free(struct pppoe_serv_t *serv)
 	if (serv->vlan_mon && conf_vlan_timeout) {
 		log_info2("pppoe: remove vlan %s\n", serv->ifname);
 		iplink_vlan_del(serv->ifindex);
-		vlan_mon_add_vid(serv->parent_ifindex, ETH_P_PPP_DISC, serv->vid);
+        if (ap_shutdown){
+            vlan_mon_add_vid(serv->parent_ifindex, ETH_P_PPP_DISC, serv->vid);
+        }else{
+            struct conf_sect_t *s = conf_get_section("pppoe");
+            if (s)
+                load_vlan_mon(s);
+        }
 	}
 
 	triton_context_unregister(&serv->ctx);
@@ -1977,10 +2003,12 @@ void pppoe_vlan_mon_notify(int ifindex, int vid, int vlan_ifindex)
 			if (r < 0)
 				continue;
 
-			__pppoe_server_start(ifr.ifr_name, opt->val, NULL, ifindex, vid, 1);
+			/* Passe apenas as opções a partir da vírgula (ptr) para preservar parâmetros como vpp-cp */
+			__pppoe_server_start(ifr.ifr_name, ptr, NULL, ifindex, vid, 1);
 			return;
 		} else if (ptr - opt->val == len && memcmp(opt->val, ifr.ifr_name, len) == 0) {
-			__pppoe_server_start(ifr.ifr_name, opt->val, NULL, ifindex, vid, 1);
+			/* Passe apenas as opções a partir da vírgula (ptr) */
+			__pppoe_server_start(ifr.ifr_name, ptr, NULL, ifindex, vid, 1);
 			return;
 		}
 	}
@@ -2312,11 +2340,32 @@ static void monitored_link_list_add(const char *name, const char *opt)
 	if (s != NULL)
 		return;
 
-	s = malloc(sizeof(*s));
+	s = _malloc(sizeof(*s));
+	memset(s, 0, sizeof(*s));
 	s->name = strdup(name);
 	s->opt = NULL;
 	if (opt)
 		s->opt = strdup(opt);
+
+	/* Pre-compile regex for "re:pattern" entries - avoid recompiling on every RTM_NEWLINK */
+	if (name && memcmp(name, "re:", 3) == 0) {
+		const char *p_end = strchr(name, ',');
+		char *pattern = NULL;
+		int pcre_err;
+		PCRE2_SIZE pcre_offset;
+		if (p_end) {
+			pattern = _malloc(p_end - (name + 3) + 1);
+			memcpy(pattern, name + 3, p_end - (name + 3));
+			pattern[p_end - (name + 3)] = 0;
+		} else {
+			pattern = strdup(name + 3);
+		}
+		s->re = (void *)pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED, 0, &pcre_err, &pcre_offset, NULL);
+		_free(pattern);
+		if (!s->re) {
+			log_warn("pppoe: failed to compile regex for monitored link '%s'\n", name);
+		}
+	}
 
 	list_add_tail(&s->entry, &monitored_link_list);
 }
@@ -2330,11 +2379,13 @@ static void monitored_link_list_del(const char *name)
 		return;
 
 	list_del(&s->entry);
+	if (s->re)
+		pcre2_code_free((pcre2_code *)s->re);
 	free(s->name);
 	if (s->opt)
 		free(s->opt);
 
-	free(s);
+	_free(s);
 }
 
 struct monitored_link_list_entry_t * monitored_link_list_find(const char *name)
@@ -2355,13 +2406,58 @@ struct monitored_link_list_entry_t * monitored_link_list_find(const char *name)
 
 static void pppoe_on_add_link(const char *name)
 {
+	struct monitored_link_list_entry_t *s;
+	char *opt_dup = NULL;
+
+	/* Primeiro: match exato já conhecido */
 	pthread_rwlock_rdlock(&serv_lock);
-	struct monitored_link_list_entry_t *s = monitored_link_list_find(name);
-	pthread_rwlock_unlock(&serv_lock);
+	s = monitored_link_list_find(name);
 	if (s != NULL) {
-		__pppoe_server_start(s->name, s->opt, NULL, -1, 0, 0);
-		log_info1("pppoe: new link event received, starting the service on: %s with options \"%s\"\n", s->name, s->opt);
+		/* Duplicar opções para liberar lock antes de iniciar */
+		opt_dup = s->opt ? _strdup(s->opt) : NULL;
+		pthread_rwlock_unlock(&serv_lock);
+
+		/* s->opt já é geralmente a parte a partir da vírgula; se não for, caímos no nome */
+		__pppoe_server_start(name, opt_dup ? opt_dup : name, NULL, -1, 0, 0);
+		log_info1("pppoe: new link event received, starting the service on: %s with options \"%s\"\n", name, opt_dup ? opt_dup : "");
+		if (opt_dup) _free(opt_dup);
+		return;
 	}
+
+	/* Segundo: verificar entradas regex já registradas (usando regex em cache) */
+	{
+		struct monitored_link_list_entry_t *it;
+		list_for_each_entry(it, &monitored_link_list, entry) {
+			if (!it->name || memcmp(it->name, "re:", 3) != 0 || !it->re)
+				continue;
+
+			pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(
+				(const pcre2_code *)it->re, NULL);
+			int r = match_data ? pcre2_match((pcre2_code *)it->re, (PCRE2_SPTR)name, strlen(name), 0, 0, match_data, NULL) : PCRE2_ERROR_NOMEMORY;
+			if (match_data)
+				pcre2_match_data_free(match_data);
+
+			if (r >= 0) {
+				/* Duplicar opções e extrair apenas a parte a partir da vírgula para passar a __pppoe_server_start */
+				opt_dup = it->opt ? _strdup(it->opt) : NULL;
+				pthread_rwlock_unlock(&serv_lock);
+
+				const char *opt_param = NULL;
+				if (opt_dup) {
+					char *p = strchr(opt_dup, ',');
+					if (p)
+						opt_param = p;
+				}
+
+				__pppoe_server_start(name, opt_param ? opt_param : name, NULL, -1, 0, 0);
+				log_info1("pppoe: new link event matched regex, starting the service on: %s with options \"%s\"\n", name, opt_param ? opt_param : "");
+				if (opt_dup) _free(opt_dup);
+				return;
+			}
+		}
+	}
+
+	pthread_rwlock_unlock(&serv_lock);
 }
 
 static void pppoe_on_del_link(const char *name)

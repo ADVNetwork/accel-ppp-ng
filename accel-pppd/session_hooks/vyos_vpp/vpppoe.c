@@ -11,6 +11,7 @@
 #include <vapi/interface.api.vapi.h>
 
 #include <linux/if_ether.h>
+#include <netinet/in.h>
 
 #include <memory.h>
 #include <stdio.h>
@@ -26,26 +27,35 @@ DEFINE_VAPI_MSG_IDS_INTERFACE_API_JSON
 
 extern void vpp_check_error(vapi_error_e err);
 
-static vapi_error_e vpppoe_s_session_add_reply_callback(struct vapi_ctx_s *ctx,
-														void *callback_ctx,
-														vapi_error_e rv,
-														bool is_last,
-														vapi_payload_pppoe_add_del_session_reply *reply)
+static void vpppoe_set_client_ip(vapi_msg_pppoe_add_del_session *req, in_addr_t client_ip)
 {
-	uint32_t *sw_ifindex = (uint32_t *)callback_ctx;
-	if (rv == VAPI_OK) {
-		if (sw_ifindex) {
-			*sw_ifindex = reply->sw_if_index;
-		}
+	req->payload.client_ip.af = ADDRESS_IP4;
+	memcpy(req->payload.client_ip.un.ip4, &client_ip, sizeof(client_ip));
+}
+
+static vapi_error_e vpppoe_s_session_add_reply_callback(struct vapi_ctx_s *ctx,
+							void *callback_ctx,
+							vapi_error_e rv,
+							bool is_last,
+							vapi_payload_pppoe_add_del_session_reply *reply)
+{
+	struct vpp_vapi_reply_ctx *reply_ctx = callback_ctx;
+
+	if (rv == VAPI_OK && reply_ctx && reply) {
+		reply_ctx->api_retval = reply->retval;
+		if (reply_ctx->api_retval == 0 && reply_ctx->sw_if_index)
+			*reply_ctx->sw_if_index = reply->sw_if_index;
 	}
 
 	return rv;
 }
 
-int vpppoe_sync_add_pppoe_interface(uint8_t *client_mac, uint16_t session_id, uint32_t *sw_ifindex)
+int vpppoe_sync_add_pppoe_interface(uint8_t *client_mac, uint16_t session_id,
+				    in_addr_t client_ip, uint32_t *sw_ifindex)
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
+	struct vpp_vapi_reply_ctx reply_ctx = { 0, sw_ifindex };
 
 	vpp_lock();
 
@@ -59,15 +69,17 @@ int vpppoe_sync_add_pppoe_interface(uint8_t *client_mac, uint16_t session_id, ui
 		goto exit;
 	}
 
-	req->payload.client_ip.af = ADDRESS_IP4;
+	vpppoe_set_client_ip(req, client_ip);
 	memcpy(req->payload.client_mac, client_mac, ETH_ALEN);
 
 	req->payload.is_add = 1;
 	req->payload.session_id = session_id;
+	/* Route installed explicitly via ip_route_add_del; keep VPP session lean. */
 	req->payload.disable_fib = 1;
 
-	err = vapi_pppoe_add_del_session(ctx, req, vpppoe_s_session_add_reply_callback, sw_ifindex);
+	err = vapi_pppoe_add_del_session(ctx, req, vpppoe_s_session_add_reply_callback, &reply_ctx);
 	vpp_check_error(err);
+	err = vpp_vapi_errno(err, &reply_ctx);
 
 exit:
 	vpp_unlock();
@@ -75,18 +87,25 @@ exit:
 }
 
 static vapi_error_e vpppoe_s_session_del_reply_callback(struct vapi_ctx_s *ctx,
-														void *callback_ctx,
-														vapi_error_e rv,
-														bool is_last,
-														vapi_payload_pppoe_add_del_session_reply *reply)
+							void *callback_ctx,
+							vapi_error_e rv,
+							bool is_last,
+							vapi_payload_pppoe_add_del_session_reply *reply)
 {
+	struct vpp_vapi_reply_ctx *reply_ctx = callback_ctx;
+
+	if (rv == VAPI_OK && reply_ctx && reply)
+		reply_ctx->api_retval = reply->retval;
+
 	return rv;
 }
 
-int vpppoe_sync_del_pppoe_interface(uint8_t *client_mac, uint16_t session_id)
+int vpppoe_sync_del_pppoe_interface(uint8_t *client_mac, uint16_t session_id,
+				    in_addr_t client_ip)
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
+	struct vpp_vapi_reply_ctx reply_ctx = { 0, NULL };
 
 	vpp_lock();
 
@@ -100,15 +119,18 @@ int vpppoe_sync_del_pppoe_interface(uint8_t *client_mac, uint16_t session_id)
 		goto exit;
 	}
 
-	req->payload.client_ip.af = ADDRESS_IP4;
+	vpppoe_set_client_ip(req, client_ip);
 	memcpy(req->payload.client_mac, client_mac, ETH_ALEN);
 
 	req->payload.is_add = 0;
 	req->payload.session_id = session_id;
 	req->payload.disable_fib = 1;
 
-	err = vapi_pppoe_add_del_session(ctx, req, vpppoe_s_session_del_reply_callback, NULL);
+	err = vapi_pppoe_add_del_session(ctx, req, vpppoe_s_session_del_reply_callback, &reply_ctx);
 	vpp_check_error(err);
+	err = vpp_vapi_errno(err, &reply_ctx);
+	if (err == VPP_API_ERR_NO_SUCH_ENTRY)
+		err = 0;
 
 exit:
 	vpp_unlock();
@@ -116,11 +138,16 @@ exit:
 }
 
 static vapi_error_e vpppoe_set_feature_callback(struct vapi_ctx_s *ctx,
-												void *callback_ctx,
-												vapi_error_e rv,
-												bool is_last,
-												vapi_payload_feature_enable_disable_reply *reply)
+						void *callback_ctx,
+						vapi_error_e rv,
+						bool is_last,
+						vapi_payload_feature_enable_disable_reply *reply)
 {
+	struct vpp_vapi_reply_ctx *reply_ctx = callback_ctx;
+
+	if (rv == VAPI_OK && reply_ctx && reply)
+		reply_ctx->api_retval = reply->retval;
+
 	return rv;
 }
 
@@ -128,6 +155,7 @@ int vpppoe_set_feature(uint32_t ifindex, int is_enabled, const char *feature, co
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
+	struct vpp_vapi_reply_ctx reply_ctx = { 0, NULL };
 
 	vpp_lock();
 
@@ -149,8 +177,9 @@ int vpppoe_set_feature(uint32_t ifindex, int is_enabled, const char *feature, co
 	req->payload.sw_if_index = ifindex;
 	req->payload.enable = is_enabled;
 
-	err = vapi_feature_enable_disable(ctx, req, vpppoe_set_feature_callback, NULL);
+	err = vapi_feature_enable_disable(ctx, req, vpppoe_set_feature_callback, &reply_ctx);
 	vpp_check_error(err);
+	err = vpp_vapi_errno(err, &reply_ctx);
 
 exit:
 	vpp_unlock();
@@ -164,15 +193,15 @@ typedef struct vpppoe_dump_interface_name_ctx_t
 } vpppoe_dump_interface_name_ctx_t;
 
 static vapi_error_e vpppoe_dump_interface_name_callback(struct vapi_ctx_s *ctx,
-											void *callback_ctx,
-											vapi_error_e rv,
-											bool is_last,
-											vapi_payload_sw_interface_details *reply)
+							void *callback_ctx,
+							vapi_error_e rv,
+							bool is_last,
+							vapi_payload_sw_interface_details *reply)
 {
 	if (callback_ctx != NULL && reply != NULL && rv == VAPI_OK) {
-		vpppoe_dump_interface_name_ctx_t *ctx = (vpppoe_dump_interface_name_ctx_t *)callback_ctx;
-		strncpy(ctx->name, (const char *)reply->interface_name, ctx->size > 64 ? 64 : ctx->size);
-		ctx->name[(ctx->size > 64 ? 64 : ctx->size) - 1] = 0;
+		vpppoe_dump_interface_name_ctx_t *dump_ctx = (vpppoe_dump_interface_name_ctx_t *)callback_ctx;
+		strncpy(dump_ctx->name, (const char *)reply->interface_name, dump_ctx->size > 64 ? 64 : dump_ctx->size);
+		dump_ctx->name[(dump_ctx->size > 64 ? 64 : dump_ctx->size) - 1] = 0;
 	}
 
 	return rv;

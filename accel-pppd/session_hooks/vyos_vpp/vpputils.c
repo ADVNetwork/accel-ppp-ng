@@ -96,6 +96,15 @@ void vpp_check_error(vapi_error_e err)
 	}
 }
 
+int vpp_vapi_errno(vapi_error_e err, const struct vpp_vapi_reply_ctx *ctx)
+{
+	if (err != VAPI_OK)
+		return (int) err;
+	if (ctx && ctx->api_retval != 0)
+		return (int) ctx->api_retval;
+	return 0;
+}
+
 static void vpppoe_load_config(void)
 {
 	char *opt;

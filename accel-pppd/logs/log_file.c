@@ -58,6 +58,8 @@ static int conf_copy;
 static int conf_fail_log;
 static pthread_t log_thr;
 
+static int log_level_monitoring;
+
 static const char* level_name[]={"  msg", "error", " warn", " info", " info", "debug"};
 static const char* level_color[]={NORMAL_COLOR, RED_COLOR, YELLOW_COLOR, GREEN_COLOR, GREEN_COLOR, BLUE_COLOR};
 
@@ -87,7 +89,7 @@ static void log_file_init(struct log_file_t *lf)
 
 static int log_file_open(struct log_file_t *lf, const char *fname)
 {
-	lf->fd = open(fname, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    lf->fd = open(fname, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 	if (lf->fd < 0) {
 		log_emerg("log_file: open '%s': %s\n", fname, strerror(errno));
 		return -1;
@@ -237,29 +239,32 @@ static void queue_log_list(struct log_file_t *lf, struct list_head *l)
 
 static void set_hdr(struct log_msg_t *msg, struct ap_session *ses)
 {
-	struct tm tm;
-	char timestamp[32];
+    struct tm tm;
+    char timestamp[32];
 
-	localtime_r(&msg->timestamp.tv_sec, &tm);
+    localtime_r(&msg->timestamp.tv_sec, &tm);
 
-	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm);
-	sprintf(msg->hdr->msg, "%s[%s]: %s: %s%s%s", conf_color ? level_color[msg->level] : "",
-		timestamp, level_name[msg->level],
-		ses ? (ses->ifname[0] ? ses->ifname : ses->ctrl->ifname) : "",
-		ses ? ": " : "",
-		conf_color ? NORMAL_COLOR : "");
-	msg->hdr->len = strlen(msg->hdr->msg);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm);
+    sprintf(msg->hdr->msg, "%s%s	%s	%s%s%s", conf_color ? level_color[msg->level] : "",
+            timestamp, level_name[msg->level],
+            ses ? (ses->ifname[0] ? ses->ifname : ses->ctrl->ifname) : "",
+            "	",
+            conf_color ? NORMAL_COLOR : "");
+    msg->hdr->len = strlen(msg->hdr->msg);
 }
+
 
 static void general_log(struct log_target_t *t, struct log_msg_t *msg, struct ap_session *ses)
 {
-	if (ses && !conf_copy) {
-		log_free_msg(msg);
-		return;
-	}
+    if (ses && !conf_copy) {
+        log_free_msg(msg);
+        return;
+    }
 
-	set_hdr(msg, ses);
-	queue_log(log_file, msg);
+    if (msg->level <= log_level_monitoring) {
+        set_hdr(msg, ses);
+        queue_log(log_file, msg);
+    }
 }
 
 static struct ap_private *find_pd(struct ap_session *ses, void *pd_key)
@@ -362,7 +367,7 @@ static void fail_reopen(void)
 {
 	const char *fname = conf_get_opt("log", "log-fail-file");
 	int old_fd = -1;
- 	int fd = open(fname, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    int fd = open(fname, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 	if (fd < 0) {
 		log_emerg("log_file: open '%s': %s\n", fname, strerror(errno));
 		return;
@@ -385,7 +390,7 @@ static void general_reopen(void)
 {
 	const char *fname = conf_get_opt("log", "log-file");
 	int old_fd = -1;
- 	int fd = open(fname, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    int fd = open(fname, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 	if (fd < 0) {
 		log_emerg("log_file: open '%s': %s\n", fname, strerror(errno));
 		return;
@@ -689,6 +694,10 @@ static void init(void)
 		}
 		conf_fail_log = 1;
 	}
+
+    opt = conf_get_opt("log", "level_monitoring");
+    if (opt && atoi(opt) >= 0)
+        log_level_monitoring = atoi(opt);
 
 	opt = conf_get_opt("log","color");
 	if (opt && atoi(opt) > 0)

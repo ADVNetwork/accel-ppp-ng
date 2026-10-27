@@ -253,6 +253,11 @@ void __export ap_session_finished(struct ap_session *ses)
 		ses->username = NULL;
 	}
 
+    if (ses->realm) {
+        _free(ses->realm);
+        ses->realm = NULL;
+    }
+
 	if (ses->ipv4_pool_name) {
 		_free(ses->ipv4_pool_name);
 		ses->ipv4_pool_name = NULL;
@@ -416,16 +421,24 @@ static void generate_sessionid(struct ap_session *ses)
 int __export ap_session_read_stats(struct ap_session *ses, struct rtnl_link_stats64 *stats)
 {
 	struct rtnl_link_stats64 lstats;
-
-	if (ses->ifindex == -1)
-		return -1;
+	int ret = -1;
 
 	if (!stats)
 		stats = &lstats;
 
-	if (iplink_get_stats(ses->ifindex, stats)) {
-		log_ppp_warn("failed to get interface statistics\n");
-		return -1;
+#ifdef HAVE_SESSION_HOOKS
+	if (ses->hooks && ses->hooks->read_stats)
+		ret = ses->hooks->read_stats(ses, stats);
+#endif
+
+	if (ret) {
+		if (ses->ifindex == -1)
+			return -1;
+
+		if (iplink_get_stats(ses->ifindex, stats)) {
+			log_ppp_warn("failed to get interface statistics\n");
+			return -1;
+		}
 	}
 
 	stats->rx_packets -= ses->acct_rx_packets_i;
@@ -457,7 +470,7 @@ int __export ap_session_set_username(struct ap_session *s, char *username)
 	pthread_rwlock_wrlock(&ses_lock);
 	if (conf_single_session >= 0) {
 		list_for_each_entry(ses, &ses_list, entry) {
-			if (ses->username && ses->terminate_cause != TERM_AUTH_ERROR && !(conf_single_session_ignore_case == 1 ? strcasecmp(ses->username, username) : strcmp(ses->username, username))) {
+            if (username && ses->username && ses->terminate_cause != TERM_AUTH_ERROR && !(conf_single_session_ignore_case == 1 ? strcasecmp(ses->username, username) : strcmp(ses->username, username))) {
 				if (conf_single_session == 0) {
 					pthread_rwlock_unlock(&ses_lock);
 					log_ppp_info1("%s: second session denied\n", username);

@@ -14,15 +14,28 @@ static void show_interfaces(void *cli)
 {
 	struct pppoe_serv_t *serv;
 
-	cli_send(cli, "interface:   connections:    state:    vpp-cp:\r\n");
-	cli_send(cli, "----------------------------------------------\r\n");
+	cli_send(cli, "interface:   connections:    state:    vpp-cp:   Vlan Mon:\r\n");
+	cli_send(cli, "----------------------------------------------------------\r\n");
 
 	pthread_rwlock_rdlock(&serv_lock);
 	list_for_each_entry(serv, &serv_list, entry) {
-		cli_sendv(cli, "%9s    %11u    %6s    %7s\r\n", serv->ifname, serv->conn_cnt, serv->stopping ? "stop" : "active",
-				serv->is_vpppoe ? "enable" : "disable");
+		cli_sendv(cli, "%9s    %11u    %6s    %7s    %9s\r\n", serv->ifname, serv->conn_cnt, serv->stopping ? "stop" : "active",
+				serv->is_vpppoe ? "enable" : "disable", serv->vlan_mon? "Yes": "No");
 	}
 	pthread_rwlock_unlock(&serv_lock);
+}
+
+static void show_interfaces_csv(void *cli)
+{
+    struct pppoe_serv_t *serv;
+
+    cli_send(cli, "interface,connections,state,vlan_mon\r\n");
+
+    pthread_rwlock_rdlock(&serv_lock);
+    list_for_each_entry(serv, &serv_list, entry) {
+        cli_sendv(cli, "%s,%u,%i,%i\r\n", serv->ifname, serv->conn_cnt, serv->stopping ? 0 : 1, serv->vlan_mon);
+    }
+    pthread_rwlock_unlock(&serv_lock);
 }
 
 static void intf_help(char * const *fields, int fields_cnt, void *client)
@@ -69,6 +82,8 @@ static int intf_exec(const char *cmd, char * const *fields, int fields_cnt, void
 	if (fields_cnt == 3) {
 		if (!strcmp(fields[2], "show"))
 			show_interfaces(client);
+        else if(!strcmp(fields[2], "show_csv"))
+            show_interfaces_csv(client);
 		else if(!strncmp(fields[2], "monitored", sizeof("monitored"))) {
 			struct monitored_link_list_entry_t *e;
 			cli_send(client, "interface:   options:\r\n");
@@ -101,6 +116,23 @@ help:
 }
 
 //===================================
+
+static int show_stat_exec_yaml(const char *cmd, char * const *fields, int fields_cnt, void *client)
+{
+    cli_send(client, "pppoe:\r\n");
+    cli_sendv(client, "     starting: %u\r\n", stat_starting);
+    cli_sendv(client, "     active: %u\r\n", stat_active);
+    cli_sendv(client, "     delayedPado: %u\r\n", stat_delayed_pado);
+    cli_sendv(client, "     recvPadi: %lu\r\n", stat_PADI_recv);
+    cli_sendv(client, "     dropPadi: %lu\r\n", stat_PADI_drop);
+    cli_sendv(client, "     sentPado: %lu\r\n", stat_PADO_sent);
+    cli_sendv(client, "     recvPadr: %lu\r\n", stat_PADR_recv);
+    cli_sendv(client, "     recvPadrDup: %lu\r\n", stat_PADR_dup_recv);
+    cli_sendv(client, "     sentPads: %lu\r\n", stat_PADS_sent);
+    cli_sendv(client, "     filtered: %lu\r\n", stat_filtered);
+
+    return CLI_CMD_OK;
+}
 
 static int show_stat_exec(const char *cmd, char * const *fields, int fields_cnt, void *client)
 {
@@ -282,7 +314,8 @@ static int set_ac_name_exec(const char *cmd, char * const *f, int f_cnt, void *c
 static void init(void)
 {
 	cli_register_simple_cmd2(show_stat_exec, NULL, 2, "show", "stat");
-	cli_register_simple_cmd2(intf_exec, intf_help, 2, "pppoe", "interface");
+    cli_register_simple_cmd2(show_stat_exec_yaml, NULL, 2, "show", "stat_yaml");
+    cli_register_simple_cmd2(intf_exec, intf_help, 2, "pppoe", "interface");
 	cli_register_simple_cmd2(set_verbose_exec, set_verbose_help, 3, "pppoe", "set", "verbose");
 	cli_register_simple_cmd2(set_pado_delay_exec, set_pado_delay_help,
 				 3, "pppoe", "set", "PADO-delay");

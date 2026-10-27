@@ -4716,6 +4716,27 @@ err_fd:
 	return -1;
 }
 
+static int show_stat_exec_yaml(const char *cmd, char * const *fields, int fields_cnt, void *client)
+{
+    cli_send(client, "l2tp:\r\n");
+    cli_send(client, "     tunnels:\r\n");
+    cli_sendv(client, "          starting: %u\r\n", stat_conn_starting);
+    cli_sendv(client, "          active: %u\r\n", stat_conn_active);
+    cli_sendv(client, "          finishing: %u\r\n", stat_conn_finishing);
+
+    cli_send(client, "     sessionsControlChannels:\r\n");
+    cli_sendv(client, "          starting: %u\r\n", stat_sess_starting);
+    cli_sendv(client, "          active: %u\r\n", stat_sess_active);
+    cli_sendv(client, "          finishing: %u\r\n", stat_sess_finishing);
+
+    cli_send(client, "     sessionsDdataChannels:\r\n");
+    cli_sendv(client, "          starting: %u\r\n", stat_starting);
+    cli_sendv(client, "          active: %u\r\n", stat_active);
+    cli_sendv(client, "          finishing: %u\r\n", stat_finishing);
+
+    return CLI_CMD_OK;
+}
+
 static int show_stat_exec(const char *cmd, char * const *fields, int fields_cnt, void *client)
 {
 	cli_send(client, "l2tp:\r\n");
@@ -5102,6 +5123,7 @@ static void l2tp_init(void)
 	start_udp_server();
 
 	cli_register_simple_cmd2(&show_stat_exec, NULL, 2, "show", "stat");
+    cli_register_simple_cmd2(&show_stat_exec_yaml, NULL, 2, "show", "stat_yaml");
 	cli_register_simple_cmd2(l2tp_create_tunnel_exec,
 				 l2tp_create_tunnel_help, 3,
 				 "l2tp", "create", "tunnel");

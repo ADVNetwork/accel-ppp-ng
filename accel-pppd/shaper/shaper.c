@@ -801,6 +801,16 @@ static void print_rate(struct ap_session *ses, char *buf)
 		*buf = 0;
 }
 
+static void print_rate_radius(struct ap_session *ses, char *buf)
+{
+    struct shaper_pd_t *pd = find_pd((struct ap_session *)ses, 0);
+
+    if (pd && (pd->cur_tr && pd->cur_tr->down_speed && pd->cur_tr->up_speed))
+        sprintf(buf, "%i/%i", pd->cur_tr->down_speed, pd->cur_tr->up_speed);
+    else
+        *buf = 0;
+}
+
 static void shaper_ctx_close(struct triton_context_t *ctx)
 {
 	struct time_range_t *r;
@@ -1062,6 +1072,8 @@ static void load_config(void)
 		opt = conf_get_opt("shaper", "vendor");
 		if (opt)
 			conf_vendor = parse_vendor_opt(opt);
+        else
+            conf_vendor = 0;
 
 		opt = conf_get_opt("shaper", "attr");
 		if (opt) {
@@ -1225,6 +1237,7 @@ static void init(void)
 	cli_register_simple_cmd2(shaper_change_exec, shaper_change_help, 2, "shaper", "change");
 	cli_register_simple_cmd2(shaper_restore_exec, shaper_restore_help, 2, "shaper", "restore");
 	cli_show_ses_register("rate-limit", "rate limit down-stream/up-stream (Kbit)", print_rate);
+    cli_show_ses_register("rate-limit-radius", "rate limit down-stream/up-stream (Kbit)", print_rate_radius);
 }
 
 DEFINE_INIT(100, init);

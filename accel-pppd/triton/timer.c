@@ -199,6 +199,11 @@ int __export triton_timer_mod(struct triton_timer_t *ud,int abs_time)
 }
 void __export triton_timer_del(struct triton_timer_t *ud)
 {
+
+    if (!ud || !ud->tpd) {
+        return;
+    }
+
 	struct _triton_timer_t *t = (struct _triton_timer_t *)ud->tpd;
 
 	if (ud == NULL || t == NULL) {

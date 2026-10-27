@@ -44,6 +44,7 @@ void cli_register_simple_cmd2(
 	...
 	);
 void cli_show_ses_register(const char *name, const char *desc, void (*print)(struct ap_session *ses, char *buf));
+void cli_show_ses_register_ex(const char *name, const char *desc, void (*print)(struct ap_session *ses, char *buf), int uses_stats);
 
 int cli_send(void *client, const char *data);
 int cli_sendv(void *client, const char *fmt, ...) __attribute__((format(gnu_printf, 2, 3)));

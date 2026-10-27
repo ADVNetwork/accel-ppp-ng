@@ -202,6 +202,8 @@ static void rad_auth_recv(struct rad_req_t *req)
 			return;
 		}
 
+        req->rpd->ses->is_radius_auth = 1;
+
 		struct ev_radius_t ev = {
 			.ses = req->rpd->ses,
 			.request = req->pack,

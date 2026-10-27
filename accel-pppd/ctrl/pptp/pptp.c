@@ -751,6 +751,15 @@ static struct pptp_serv_t serv=
 	.ctx.before_switch = pptp_ctx_switch,
 };
 
+static int show_stat_exec_yaml(const char *cmd, char * const *fields, int fields_cnt, void *client)
+{
+    cli_send(client, "pptp:\r\n");
+    cli_sendv(client,"     starting: %u\r\n", stat_starting);
+    cli_sendv(client,"     active: %u\r\n", stat_active);
+
+    return CLI_CMD_OK;
+}
+
 static int show_stat_exec(const char *cmd, char * const *fields, int fields_cnt, void *client)
 {
 	cli_send(client, "pptp:\r\n");
@@ -893,8 +902,9 @@ static void pptp_init(void)
 	triton_context_wakeup(&serv.ctx);
 
 	cli_register_simple_cmd2(show_stat_exec, NULL, 2, "show", "stat");
+    cli_register_simple_cmd2(show_stat_exec_yaml, NULL, 2, "show", "stat_yaml");
 
-	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
+    triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
 }
 
 DEFINE_INIT(20, pptp_init);

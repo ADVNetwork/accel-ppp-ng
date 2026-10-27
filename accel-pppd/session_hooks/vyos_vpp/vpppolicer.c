@@ -214,8 +214,14 @@ int vpppolicer_install_limiter(struct ap_session *ses, int down_speed, int down_
 			goto exit;
 		}
 
-		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 1, "policer-input", "ip4-unicast");
-		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 1, "policer-input", "ip6-unicast");
+		/*
+		 * VPP's policer_input() API (src/vnet/policer/policer.c) already
+		 * enables policer-input on device-input + ip4-unicast + ip6-unicast.
+		 * Only the multicast arcs are not covered by the API and must be
+		 * enabled manually here. Without this split, ip4/ip6-unicast end up
+		 * with the feature twice (API + manual), policing every packet twice
+		 * against the same token bucket and dropping ~all conformed traffic.
+		 */
 		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 1, "policer-input", "ip4-multicast");
 		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 1, "policer-input", "ip6-multicast");
 
@@ -246,15 +252,36 @@ int vpppolicer_remove_limiter(struct ap_session *ses)
 
 	if (vpphook_data->vpppolicer_up) {
 		vpppolicer_generate_name(policer_input, POLICER_NAME_MAX_LEN - 1, ses, vpphook_data->vpppolicer_up, vpphook_data->vpppolicer_up_burst, 1);
+
+		/*
+		 * Disable all feature arcs BEFORE clearing the policer index and
+		 * deleting the policer object.
+		 *
+		 * Bug: the previous order was:
+		 *   1. set_input(0)  -> sets policer_index_by_sw_if_index[RX][sw_if] = ~0
+		 *                       + disables policer-input on device-input arc
+		 *   2. add_del(0)    -> frees the policer from the VPP pool  <-- too early
+		 *   3. set_feature(0, "ip4-unicast") ... etc.                <-- too late
+		 *
+		 * Between steps 2 and 3, packets traversing the ip4/ip6-unicast/multicast
+		 * arcs still hit the policer-input node. That node reads
+		 * policer_index_by_sw_if_index[RX][sw_if] = ~0 and passes ~0 directly to
+		 * vnet_policer_police(), which does &pm->policers[~0] -- an out-of-bounds
+		 * pool access that crashes the VPP worker thread.
+		 *
+		 * Correct order: disable every arc first, then clear the index, then free.
+		 *
+		 * VPP's policer_input() API disables device-input + ip4-unicast +
+		 * ip6-unicast (matching the enable path), so only the multicast arcs
+		 * need to be disabled manually here.
+		 */
+		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 0, "policer-input", "ip4-multicast");
+		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 0, "policer-input", "ip6-multicast");
+
 		ret = vpppolicer_set_input(0, vpphook_data->vpp_sw_if_index, policer_input);
 		if (ret)
 			goto exit;
 		vpppolicer_add_del(0, policer_input, vpphook_data->vpppolicer_up, vpphook_data->vpppolicer_up_burst);
-
-		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 0, "policer-input", "ip4-unicast");
-		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 0, "policer-input", "ip6-unicast");
-		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 0, "policer-input", "ip4-multicast");
-		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 0, "policer-input", "ip6-multicast");
 
 		vpphook_data->vpppolicer_up = 0;
 		vpphook_data->vpppolicer_up_burst = 0;
@@ -332,6 +359,19 @@ static void vpppolicer_load_config(void)
 	opt = conf_get_opt("shaper", "vpp-violate-action");
 	if (opt)
 		s_violate_action = vpppolicer_parse_action(opt);
+
+	/* Per-type constraints override generic factor opts (1R2C rejects EIR/EB). */
+	switch (s_vpp_policer_type) {
+	case SSE2_QOS_POLICER_TYPE_API_1R2C:
+		s_eir_factor = 0;
+		s_eb_factor = 0;
+		break;
+	case SSE2_QOS_POLICER_TYPE_API_1R3C_RFC_2697:
+		s_eir_factor = 0;
+		break;
+	default:
+		break;
+	}
 }
 
 static void vpppolicer_init()
