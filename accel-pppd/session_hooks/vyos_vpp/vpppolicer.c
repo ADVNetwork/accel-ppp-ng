@@ -23,8 +23,6 @@ DEFINE_VAPI_MSG_IDS_POLICER_API_JSON
 
 #define POLICER_NAME_MAX_LEN 64
 
-extern void vpp_check_error(vapi_error_e err);
-
 static uint32_t s_vpp_policer_type = SSE2_QOS_POLICER_TYPE_API_2R3C_RFC_2698;
 static double s_cir_factor = 0.8;
 static double s_cb_factor = 1;
@@ -66,7 +64,7 @@ int vpppolicer_set_input(int is_add, uint32_t ifindex, const char *policer_name)
 	req->payload.sw_if_index = ifindex;
 
 	err = vapi_policer_input(ctx, req, vpppolicer_set_input_callback, NULL);
-	vpp_check_error(err);
+	err = vpp_vapi_complete(err);
 
 exit:
 	vpp_unlock();
@@ -105,7 +103,7 @@ int vpppolicer_set_output(int is_add, uint32_t ifindex, const char *policer_name
 	req->payload.sw_if_index = ifindex;
 
 	err = vapi_policer_output(ctx, req, vpppolicer_set_output_callback, NULL);
-	vpp_check_error(err);
+	err = vpp_vapi_complete(err);
 
 exit:
 	vpp_unlock();
@@ -158,7 +156,7 @@ static int vpppolicer_add_del(int is_add, const char *policer_name, uint32_t cir
 	req->payload.color_aware = 0;
 
 	err = vapi_policer_add_del(ctx, req, vpppolicer_add_del_callback, NULL);
-	vpp_check_error(err);
+	err = vpp_vapi_complete(err);
 
 exit:
 	vpp_unlock();

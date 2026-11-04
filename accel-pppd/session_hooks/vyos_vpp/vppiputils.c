@@ -16,8 +16,6 @@
 
 DEFINE_VAPI_MSG_IDS_IP_API_JSON
 
-extern void vpp_check_error(vapi_error_e err);
-
 struct vpp_route_t {
 	struct list_head entry;
 
@@ -141,7 +139,7 @@ int vpp_ip4_host_route_present(uint32_t sw_if_index, in_addr_t dst)
 	req->payload.prefix.len = 32;
 
 	err = vapi_ip_route_lookup(ctx, req, vpp_ip_route_lookup_cb, &lookup_ctx);
-	vpp_check_error(err);
+	err = vpp_vapi_complete(err);
 
 exit:
 	vpp_unlock();
@@ -185,7 +183,7 @@ int vpp_ip6_prefix_route_present(uint32_t sw_if_index, const struct in6_addr *ds
 	req->payload.prefix.len = prefix_len;
 
 	err = vapi_ip_route_lookup(ctx, req, vpp_ip_route_lookup_cb, &lookup_ctx);
-	vpp_check_error(err);
+	err = vpp_vapi_complete(err);
 
 exit:
 	vpp_unlock();
@@ -219,12 +217,13 @@ static int vpp_iproute(int is_add, int ifindex, in_addr_t dst, int mask)
 
 	vpp_lock();
 
-	ctx = vpp_get_vapi();
-	if (ctx == NULL) {
-		goto exit;
-	}
-
 	for (attempt = 0; attempt < 3; attempt++) {
+		/* A failed attempt may have dropped the connection. */
+		ctx = vpp_get_vapi();
+		if (ctx == NULL) {
+			goto exit;
+		}
+
 		vapi_msg_ip_route_add_del *req = vapi_alloc_ip_route_add_del(ctx, 1);
 		if (req == NULL) {
 			goto exit;
@@ -239,7 +238,7 @@ static int vpp_iproute(int is_add, int ifindex, in_addr_t dst, int mask)
 		req->payload.route.paths[0].sw_if_index = ifindex;
 
 		err = vapi_ip_route_add_del(ctx, req, vpp_ip_ro_cb, &reply_ctx);
-		vpp_check_error(err);
+		err = vpp_vapi_complete(err);
 		err = vpp_vapi_errno(err, &reply_ctx);
 		if (err == 0 || !is_add)
 			break;
@@ -290,12 +289,13 @@ static int vpp_ip6route(int is_add, int ifindex, const struct in6_addr *dst, int
 
 	vpp_lock();
 
-	ctx = vpp_get_vapi();
-	if (ctx == NULL) {
-		goto exit;
-	}
-
 	for (attempt = 0; attempt < 3; attempt++) {
+		/* A failed attempt may have dropped the connection. */
+		ctx = vpp_get_vapi();
+		if (ctx == NULL) {
+			goto exit;
+		}
+
 		vapi_msg_ip_route_add_del *req = vapi_alloc_ip_route_add_del(ctx, 1);
 		if (req == NULL) {
 			goto exit;
@@ -310,7 +310,7 @@ static int vpp_ip6route(int is_add, int ifindex, const struct in6_addr *dst, int
 		req->payload.route.paths[0].sw_if_index = ifindex;
 
 		err = vapi_ip_route_add_del(ctx, req, vpp_ip6_ro_cb, &reply_ctx);
-		vpp_check_error(err);
+		err = vpp_vapi_complete(err);
 		err = vpp_vapi_errno(err, &reply_ctx);
 		if (err == 0 || !is_add)
 			break;

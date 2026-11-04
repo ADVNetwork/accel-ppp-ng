@@ -8,11 +8,20 @@
 #include <vapi/vpe.api.vapi.h>
 
 #include <pthread.h>
+#include <time.h>
 
 #include "triton.h"
 #include "events.h"
+#include "log.h"
 
 #include "vpputils.h"
+
+/*
+ * How long a thread waits for a VPP reply before dropping the connection.
+ * VAPI gives up after 1 second on the socket transport, which is too short
+ * for a busy VPP. The caller holds vpp_lock during the wait.
+ */
+#define VPP_REPLY_TIMEOUT_SEC 10
 
 int sc_vpp_queue_size = 1024;
 
@@ -55,7 +64,7 @@ void vpppoe_disconnect_from_vpp()
 }
 
 struct vapi_ctx_s * vpp_get_vapi() {
-	if (vpp_connect.vapi == NULL && __sync_fetch_and_and(&vpp_connect.rfcounter, 1)) {
+	if (vpp_connect.vapi == NULL && __atomic_load_n(&vpp_connect.rfcounter, __ATOMIC_SEQ_CST)) {
 		vpppoe_connect_to_vpp();
 	}
 	return vpp_connect.vapi;
@@ -89,11 +98,48 @@ void vpp_put()
 	vpp_unlock();
 }
 
-void vpp_check_error(vapi_error_e err)
+static long vpp_elapsed_ms(const struct timespec *start)
 {
-	if (vpp_connect.vapi && err >= VAPI_ECON_FAIL) {
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (now.tv_sec - start->tv_sec) * 1000 + (now.tv_nsec - start->tv_nsec) / 1000000;
+}
+
+vapi_error_e vpp_vapi_complete(vapi_error_e err)
+{
+	vapi_ctx_t ctx = vpp_connect.vapi;
+	struct timespec start;
+
+	if (ctx == NULL)
+		return err;
+
+	if (err == VAPI_EAGAIN && !vapi_requests_empty(ctx)) {
+		clock_gettime(CLOCK_MONOTONIC, &start);
+		do {
+			if (vpp_elapsed_ms(&start) >= VPP_REPLY_TIMEOUT_SEC * 1000) {
+				err = VAPI_ENORESP;
+				break;
+			}
+			err = vapi_dispatch(ctx);
+		} while (err == VAPI_EAGAIN);
+
+		if (err == VAPI_OK)
+			log_warn("vpp: slow reply, %ld ms beyond the VAPI timeout\n",
+				 vpp_elapsed_ms(&start));
+	}
+
+	/*
+	 * A request still queued holds a callback context on the stack of a
+	 * caller about to return. Dropping the connection discards the request,
+	 * so its late reply can never reach that context.
+	 */
+	if (err >= VAPI_ECON_FAIL || !vapi_requests_empty(ctx)) {
+		log_error("vpp: dropping connection, api call failed err=%d\n", (int)err);
 		vpppoe_disconnect_from_vpp();
 	}
+
+	return err;
 }
 
 int vpp_vapi_errno(vapi_error_e err, const struct vpp_vapi_reply_ctx *ctx)

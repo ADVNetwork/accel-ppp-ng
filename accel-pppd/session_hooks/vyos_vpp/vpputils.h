@@ -25,6 +25,13 @@ struct vpp_vapi_reply_ctx {
 	uint32_t *sw_if_index;
 };
 
+/*
+ * Call with vpp_lock held, right after every VAPI request. Waits for a late
+ * reply and returns the final result. On return the request is finished, or
+ * the connection was dropped: fetch the context again with vpp_get_vapi().
+ */
+vapi_error_e vpp_vapi_complete(vapi_error_e err);
+
 int vpp_vapi_errno(vapi_error_e err, const struct vpp_vapi_reply_ctx *ctx);
 
 /* vnet/error.h: VNET_API_ERROR_NO_SUCH_ENTRY */

@@ -25,8 +25,6 @@ DEFINE_VAPI_MSG_IDS_PPPOE_API_JSON
 DEFINE_VAPI_MSG_IDS_FEATURE_API_JSON
 DEFINE_VAPI_MSG_IDS_INTERFACE_API_JSON
 
-extern void vpp_check_error(vapi_error_e err);
-
 static void vpppoe_set_client_ip(vapi_msg_pppoe_add_del_session *req, in_addr_t client_ip)
 {
 	req->payload.client_ip.af = ADDRESS_IP4;
@@ -78,7 +76,7 @@ int vpppoe_sync_add_pppoe_interface(uint8_t *client_mac, uint16_t session_id,
 	req->payload.disable_fib = 1;
 
 	err = vapi_pppoe_add_del_session(ctx, req, vpppoe_s_session_add_reply_callback, &reply_ctx);
-	vpp_check_error(err);
+	err = vpp_vapi_complete(err);
 	err = vpp_vapi_errno(err, &reply_ctx);
 
 exit:
@@ -127,7 +125,7 @@ int vpppoe_sync_del_pppoe_interface(uint8_t *client_mac, uint16_t session_id,
 	req->payload.disable_fib = 1;
 
 	err = vapi_pppoe_add_del_session(ctx, req, vpppoe_s_session_del_reply_callback, &reply_ctx);
-	vpp_check_error(err);
+	err = vpp_vapi_complete(err);
 	err = vpp_vapi_errno(err, &reply_ctx);
 	if (err == VPP_API_ERR_NO_SUCH_ENTRY)
 		err = 0;
@@ -178,7 +176,7 @@ int vpppoe_set_feature(uint32_t ifindex, int is_enabled, const char *feature, co
 	req->payload.enable = is_enabled;
 
 	err = vapi_feature_enable_disable(ctx, req, vpppoe_set_feature_callback, &reply_ctx);
-	vpp_check_error(err);
+	err = vpp_vapi_complete(err);
 	err = vpp_vapi_errno(err, &reply_ctx);
 
 exit:
@@ -234,7 +232,7 @@ int vpppoe_dump_interface_name(uint32_t ifindex, char *name, size_t size)
 	req->payload.sw_if_index = ifindex;
 
 	err = vapi_sw_interface_dump(ctx, req, vpppoe_dump_interface_name_callback, &dump_ctx);
-	vpp_check_error(err);
+	err = vpp_vapi_complete(err);
 
 exit:
 	vpp_unlock();
