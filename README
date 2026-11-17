@@ -39,6 +39,7 @@ Requirment
 7. libpcre2
 8. net-snmp-5.x 
 9. libssl-0.9.8 or probably later (openssl-0.9.8)
+10. glib-2.0 and pkg-config (required for radius)
 
 
 Compilation and instalation

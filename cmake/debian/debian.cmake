@@ -69,3 +69,12 @@ IF (LUA)
 		SET(CPACK_DEBIAN_PACKAGE_DEPENDS "${CPACK_DEBIAN_PACKAGE_DEPENDS}, liblua${LUA}-0")
 	ENDIF ()
 ENDIF (LUA)
+
+# The radius module links glib (accel-pppd/radius/CMakeLists.txt). RADIUS gets
+# its TRUE default only later, in accel-pppd/CMakeLists.txt, so undefined here
+# means enabled. libglib2.0-0t64 (Debian 13, Ubuntu 24.04) provides
+# libglib2.0-0 with its own version, so one name covers every profile. 2.32.0
+# is the minimum dpkg-shlibdeps derives from the symbols radius uses.
+IF (RADIUS OR NOT DEFINED RADIUS)
+	SET(CPACK_DEBIAN_PACKAGE_DEPENDS "${CPACK_DEBIAN_PACKAGE_DEPENDS}, libglib2.0-0 (>= 2.32.0)")
+ENDIF ()
