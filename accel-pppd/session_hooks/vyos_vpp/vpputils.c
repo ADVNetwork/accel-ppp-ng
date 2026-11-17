@@ -15,6 +15,7 @@
 #include "log.h"
 
 #include "vpputils.h"
+#include "vppreconcile.h"
 
 /*
  * How long a thread waits for a VPP reply before dropping the connection.
@@ -23,7 +24,24 @@
  */
 #define VPP_REPLY_TIMEOUT_SEC 10
 
+/*
+ * Wait between failed startup reconciliations (vppreconcile.c): 5 s after the
+ * first failure, doubled after each one up to 60 s. A failure that does not
+ * go away by itself (a session VPP refuses to delete, a VPP that does not
+ * list its sessions) is not hammered with dumps every 5 s.
+ */
+#define VPP_RECONCILE_RETRY_MIN_SEC 5
+#define VPP_RECONCILE_RETRY_MAX_SEC 60
+
 int sc_vpp_queue_size = 1024;
+
+/*
+ * Set once the startup reconciliation succeeded. Until then this process has
+ * created nothing in VPP, so everything PPPoE found there is an orphan.
+ */
+static int vpp_reconciled;
+static time_t vpp_reconcile_failed_at;
+static int vpp_reconcile_retry_sec = VPP_RECONCILE_RETRY_MIN_SEC;
 
 struct vpp_connect_t
 {
@@ -36,9 +54,19 @@ struct vpp_connect_t
 
 const char vpp_app_name[] = "accel-vpp";
 
+void vpppoe_disconnect_from_vpp();
+
 static void vpppoe_connect_to_vpp()
 {
+	struct timespec now;
+
 	vpp_connect.vapi = NULL;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (!vpp_reconciled && vpp_reconcile_failed_at &&
+	    now.tv_sec - vpp_reconcile_failed_at < vpp_reconcile_retry_sec)
+		return;
+
 	vapi_error_e verr = vapi_ctx_alloc(&vpp_connect.vapi);
 
 	if (verr != VAPI_OK || vpp_connect.vapi == NULL) {
@@ -52,6 +80,33 @@ static void vpppoe_connect_to_vpp()
 		vpp_connect.vapi = NULL;
 		return;
 	}
+
+	if (vpp_reconciled)
+		return;
+
+	/*
+	 * First connection of the process: clear what a previous accel-ppp left
+	 * in VPP before anyone gets the context. On failure no context is
+	 * handed out, so no session is created next to an orphan one with the
+	 * same session_id.
+	 */
+	if (vpp_reconcile_orphans() == 0) {
+		vpp_reconciled = 1;
+		return;
+	}
+
+	/* the wait before the next attempt: the one of the previous failure, doubled */
+	if (vpp_reconcile_failed_at) {
+		vpp_reconcile_retry_sec *= 2;
+		if (vpp_reconcile_retry_sec > VPP_RECONCILE_RETRY_MAX_SEC)
+			vpp_reconcile_retry_sec = VPP_RECONCILE_RETRY_MAX_SEC;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	vpp_reconcile_failed_at = now.tv_sec ? now.tv_sec : 1;
+	log_error("vpp: startup reconciliation failed, no session will be created until it succeeds "
+		  "(retry in %d s)\n", vpp_reconcile_retry_sec);
+	vpppoe_disconnect_from_vpp();
 }
 
 void vpppoe_disconnect_from_vpp()
@@ -61,6 +116,11 @@ void vpppoe_disconnect_from_vpp()
 		vapi_ctx_free(vpp_connect.vapi);
 		vpp_connect.vapi = NULL;
 	}
+}
+
+struct vapi_ctx_s *vpp_peek_vapi(void)
+{
+	return vpp_connect.vapi;
 }
 
 struct vapi_ctx_s * vpp_get_vapi() {

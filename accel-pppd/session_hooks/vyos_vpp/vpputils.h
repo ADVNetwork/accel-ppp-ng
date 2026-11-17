@@ -12,6 +12,8 @@
 
 struct vapi_ctx_s;
 struct vapi_ctx_s * vpp_get_vapi();
+/* Current context, without connecting. Call with vpp_lock held. */
+struct vapi_ctx_s *vpp_peek_vapi(void);
 
 void vpp_lock();
 void vpp_unlock();

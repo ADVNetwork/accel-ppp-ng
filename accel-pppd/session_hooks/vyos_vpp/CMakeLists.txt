@@ -5,6 +5,7 @@ SET(sources
 	vppiputils.c
 	vpppoe.c
 	vpppolicer.c
+	vppreconcile.c
 	vpputils.c
 	vppstats.c
 )

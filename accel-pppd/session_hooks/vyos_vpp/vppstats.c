@@ -177,6 +177,56 @@ static void vpp_stats_disconnect(void)
 	pthread_mutex_unlock(&vpp_stats_lock);
 }
 
+/*
+ * Names of the VPP interfaces by sw_if_index, from /if/names in the stat
+ * segment. Unlike sw_interface_dump, the stat segment also names the hidden
+ * interfaces (a pppoeN kept for reuse after its session is deleted): the
+ * startup reconciliation uses it to tell a hidden pppoeN from an interface
+ * of someone else (vppreconcile.c).
+ *
+ * cb runs with vpp_stats_lock held; the name is valid only during the call.
+ * Returns 0, or -1 if the stat segment could not be read.
+ */
+int vpphook_stats_if_names(void (*cb)(uint32_t sw_if_index, const char *name, void *arg), void *arg)
+{
+	u8 **patterns = 0;
+	u32 *dir;
+	stat_segment_data_t *res;
+	int i, j, ret = -1;
+
+	pthread_mutex_lock(&vpp_stats_lock);
+
+	if (vpp_stats_connect_locked())
+		goto out;
+
+	vec_add1(patterns, (u8 *)"^/if/names$");
+	dir = stat_segment_ls(patterns);
+	vec_free(patterns);
+	if (!dir)
+		goto out;
+
+	res = stat_segment_dump(dir);
+	vec_free(dir);
+	if (!res)
+		goto out;
+
+	for (i = 0; i < vec_len(res); i++) {
+		if (res[i].type != STAT_DIR_TYPE_NAME_VECTOR)
+			continue;
+		for (j = 0; j < vec_len(res[i].name_vector); j++) {
+			if (res[i].name_vector[j])
+				cb(j, (const char *)res[i].name_vector[j], arg);
+		}
+		ret = 0;
+	}
+
+	stat_segment_data_free(res);
+
+out:
+	pthread_mutex_unlock(&vpp_stats_lock);
+	return ret;
+}
+
 static int vpp_stats_inotify_read(struct triton_md_handler_t *hnd)
 {
 	char buf[sizeof(struct inotify_event) + 256];
