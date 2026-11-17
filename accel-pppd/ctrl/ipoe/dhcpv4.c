@@ -1252,7 +1252,7 @@ void dhcpv4_reserve_ip(struct dhcpv4_serv *serv, uint32_t ip)
 		return;
 
 	pthread_mutex_lock(&serv->range->lock);
-	serv->range->free[n / (8 * sizeof(long))] |= 1 << (n % (8 * sizeof(long)));
+	serv->range->free[n / (8 * sizeof(long))] |= 1lu << (n % (8 * sizeof(long)));
 	pthread_mutex_unlock(&serv->range->lock);
 }
 
