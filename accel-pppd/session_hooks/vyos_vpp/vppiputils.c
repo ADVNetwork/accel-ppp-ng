@@ -231,7 +231,17 @@ static int vpp_iproute(int is_add, int ifindex, in_addr_t dst, int mask)
 
 		reply_ctx.api_retval = 0;
 		req->payload.is_add = is_add;
-		req->payload.is_multipath = 0;
+		/*
+		 * Add replaces the paths of the prefix: the session that comes
+		 * last gets the traffic. Delete removes only the path through
+		 * this session (is_multipath). A delete by prefix removed the
+		 * whole entry, so an old session that ended took the route of a
+		 * newer one holding the same prefix (the same Framed-Route, a
+		 * fixed address reconnecting). With the path already replaced
+		 * by the newer session, the delete finds nothing and VPP
+		 * answers 0.
+		 */
+		req->payload.is_multipath = !is_add;
 		req->payload.route.prefix.address.af = ADDRESS_IP4;
 		memcpy(req->payload.route.prefix.address.un.ip4, &dst, sizeof(dst));
 		req->payload.route.prefix.len = mask;
@@ -303,7 +313,8 @@ static int vpp_ip6route(int is_add, int ifindex, const struct in6_addr *dst, int
 
 		reply_ctx.api_retval = 0;
 		req->payload.is_add = is_add;
-		req->payload.is_multipath = 0;
+		/* delete only the path through this session, see vpp_iproute() */
+		req->payload.is_multipath = !is_add;
 		req->payload.route.prefix.address.af = ADDRESS_IP6;
 		memcpy(req->payload.route.prefix.address.un.ip6, dst, sizeof(*dst));
 		req->payload.route.prefix.len = pref_len;
