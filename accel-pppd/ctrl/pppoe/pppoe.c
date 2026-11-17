@@ -1433,7 +1433,8 @@ static int parse_server(const char *opt, int *padi_limit, struct ap_net **net, i
 			opt = endptr;
 		} else if (!strncmp(opt, "net=", sizeof("net=") - 1)) {
 			ptr++;
-			for (endptr = ptr + 1; *endptr && *endptr != ','; endptr++);
+			/* from ptr, not ptr + 1: an empty value ends the string here */
+			for (endptr = ptr; *endptr && *endptr != ','; endptr++);
 			if (endptr - ptr >= sizeof(optval))
 				goto out_err;
 			memcpy(optval, ptr, endptr - ptr);
@@ -1441,15 +1442,20 @@ static int parse_server(const char *opt, int *padi_limit, struct ap_net **net, i
 			*net = ap_net_find(optval);
 			if (!*net)
 				goto out_err;
+			opt = endptr;
 		} else if (!strncmp(opt, "vpp-cp=", sizeof("vpp-cp=") - 1)) {
 			ptr++;
-			for (endptr = ptr + 1; *endptr && *endptr != ','; endptr++);
+			for (endptr = ptr; *endptr && *endptr != ','; endptr++);
+			/* as in net=: the value has to fit optval */
+			if (endptr - ptr >= sizeof(optval))
+				goto out_err;
 			memcpy(optval, ptr, endptr - ptr);
 			optval[endptr - ptr] = 0;
 			if (is_vpppoe)
 				*is_vpppoe = !strncasecmp(optval, "enable", sizeof("enable") - 1) ||
 								!strncasecmp(optval, "true", sizeof("true") - 1) ||
 								!strncasecmp(optval, "1", sizeof("1") - 1);
+			opt = endptr;
 		} else
 			goto out_err;
 	}
