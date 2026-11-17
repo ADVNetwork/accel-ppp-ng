@@ -27,4 +27,12 @@ int vpp_ip6_prefix_route_present(uint32_t sw_if_index, const struct in6_addr *ds
 /* remove VPP IPv4 & IPv6 routes related to session */
 int vpp_iproute_flush(struct ap_session *ses);
 
+/* add/remove the kernel copies of the session routes per [vpp-route-export];
+ * runs in the session context */
+void vpp_iproute_kernel_sync(struct ap_session *ses);
+
+/* drop the saved routes (and their kernel copies) without touching VPP;
+ * for a session freed without pppoe_terminate */
+void vpp_iproute_forget(struct ap_session *ses);
+
 #endif /* VPPIPUTILS_H */

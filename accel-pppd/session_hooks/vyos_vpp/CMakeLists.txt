@@ -3,6 +3,7 @@ INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR})
 SET(sources
 	vpphooks.c
 	vppiputils.c
+	vppkroute.c
 	vpppoe.c
 	vpppolicer.c
 	vppreconcile.c

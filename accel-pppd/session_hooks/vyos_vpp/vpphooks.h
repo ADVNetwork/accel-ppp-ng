@@ -8,6 +8,7 @@
 #define VPPHOOKS_H
 
 #include <stdint.h>
+#include <pthread.h>
 
 #include "ap_session.h"
 
@@ -16,7 +17,14 @@
 struct vpphook_private_data_t {
 	struct ap_private pd;
 	uint32_t vpp_sw_if_index;
+	/*
+	 * Routes of the session in VPP (vppiputils.c). The session context is
+	 * not the only one that touches the list: the route watchdog timer
+	 * (vpphooks.c) reinstalls a missing route from its own context. Every
+	 * access to the list and to its entries holds vpp_routes_lock.
+	 */
 	struct list_head vpp_routes;
+	pthread_mutex_t vpp_routes_lock;
 	uint32_t vpppolicer_down;
 	uint64_t vpppolicer_down_burst;
 	uint32_t vpppolicer_up;

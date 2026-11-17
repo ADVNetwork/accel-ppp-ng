@@ -80,6 +80,7 @@ int vpphook_session_hook_init(struct ap_session *ses)
 	pd->pd.key = &pd_key;
 
 	INIT_LIST_HEAD(&pd->vpp_routes);
+	pthread_mutex_init(&pd->vpp_routes_lock, NULL);
 
 	list_add_tail(&pd->pd.entry, &ses->pd_list);
 
@@ -92,7 +93,16 @@ void vpphook_session_hook_deinit(struct ap_session *ses)
 	if (pd == NULL)
 		return;
 
+	/* Normally empty already (pppoe_terminate flushes the routes). */
+	vpp_iproute_forget(ses);
+
+	/*
+	 * The session left ses_list under the write lock before this point, and
+	 * the watchdog only works on a session with the read lock held: nobody
+	 * else has the lock now.
+	 */
 	list_del(&pd->pd.entry);
+	pthread_mutex_destroy(&pd->vpp_routes_lock);
 	_free(pd);
 }
 

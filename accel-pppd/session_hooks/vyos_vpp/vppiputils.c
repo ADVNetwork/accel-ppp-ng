@@ -6,6 +6,8 @@
 
 #include <vapi/ip.api.vapi.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "ap_session.h"
 #include "triton.h"
@@ -13,6 +15,7 @@
 #include "vpphooks.h"
 
 #include "vppiputils.h"
+#include "vppkroute.h"
 
 DEFINE_VAPI_MSG_IDS_IP_API_JSON
 
@@ -32,56 +35,157 @@ struct vpp_route_t {
 			int preffix;
 		} ip6;
 	} un;
+
+	/* Dummy ifindex holding the kernel copy ([vpp-route-export]), 0 = none. */
+	int kifindex;
 };
+
+static const void *vpp_route_dst(const struct vpp_route_t *r)
+{
+	return r->af == AF_INET ? (const void *)&r->un.ip4.dst : (const void *)&r->un.ip6.dst;
+}
+
+static int vpp_route_len(const struct vpp_route_t *r)
+{
+	return r->af == AF_INET ? r->un.ip4.mask : r->un.ip6.preffix;
+}
+
+static int vpp_route_match(const struct vpp_route_t *r, int af, const void *dst, int len)
+{
+	if (r->af != af || vpp_route_len(r) != len)
+		return 0;
+
+	return !memcmp(vpp_route_dst(r), dst, af == AF_INET ? 4 : 16);
+}
+
+/* Bring the kernel copy of the route in line with [vpp-route-export]. */
+static void vpp_route_kernel_sync(struct vpp_route_t *r)
+{
+	int want = vpp_kroute_lookup(r->af, vpp_route_dst(r), vpp_route_len(r));
+
+	if (r->kifindex == want)
+		return;
+
+	/* Not covered any more, or the dummy was recreated with a new ifindex. */
+	if (r->kifindex) {
+		vpp_kroute_del(r->kifindex, r->af, vpp_route_dst(r), vpp_route_len(r));
+		r->kifindex = 0;
+	}
+
+	if (want && vpp_kroute_add(want, r->af, vpp_route_dst(r), vpp_route_len(r)) == 0)
+		r->kifindex = want;
+}
+
+static void vpp_route_kernel_del(struct vpp_route_t *r)
+{
+	if (!r->kifindex)
+		return;
+
+	vpp_kroute_del(r->kifindex, r->af, vpp_route_dst(r), vpp_route_len(r));
+	r->kifindex = 0;
+}
+
+/*
+ * Remember a route added to VPP for this session. The same route added again
+ * (watchdog reinstall, address and peer hooks) keeps a single entry.
+ *
+ * The watchdog reinstall comes from the watchdog timer context, not from the
+ * session: the list and its entries are only touched with vpp_routes_lock
+ * held, here and in every function below.
+ */
+static void vpp_route_save(struct ap_session *ses, int af, const void *dst, int len)
+{
+	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
+	struct vpp_route_t *saved_route;
+
+	if (!vpphook_data)
+		return;
+
+	pthread_mutex_lock(&vpphook_data->vpp_routes_lock);
+
+	list_for_each_entry(saved_route, &vpphook_data->vpp_routes, entry) {
+		if (vpp_route_match(saved_route, af, dst, len)) {
+			vpp_route_kernel_sync(saved_route);
+			goto out;
+		}
+	}
+
+	saved_route = (struct vpp_route_t *)malloc(sizeof(*saved_route));
+	if (!saved_route)
+		goto out;
+
+	memset(saved_route, 0, sizeof(*saved_route));
+	saved_route->af = af;
+	if (af == AF_INET) {
+		memcpy(&saved_route->un.ip4.dst, dst, 4);
+		saved_route->un.ip4.mask = len;
+	} else {
+		memcpy(&saved_route->un.ip6.dst, dst, 16);
+		saved_route->un.ip6.preffix = len;
+	}
+	list_add_tail(&saved_route->entry, &vpphook_data->vpp_routes);
+
+	vpp_route_kernel_sync(saved_route);
+
+out:
+	pthread_mutex_unlock(&vpphook_data->vpp_routes_lock);
+}
+
+static void vpp_route_del_saved(struct ap_session *ses, int af, const void *dst, int len)
+{
+	struct list_head *pos, *n;
+	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
+
+	if (!vpphook_data)
+		return;
+
+	pthread_mutex_lock(&vpphook_data->vpp_routes_lock);
+
+	list_for_each_safe(pos, n, &vpphook_data->vpp_routes) {
+		struct vpp_route_t *saved_route = list_entry(pos, typeof(*saved_route), entry);
+
+		if (vpp_route_match(saved_route, af, dst, len)) {
+			vpp_route_kernel_del(saved_route);
+			list_del(&saved_route->entry);
+			free(saved_route);
+		}
+	}
+
+	pthread_mutex_unlock(&vpphook_data->vpp_routes_lock);
+}
 
 static void vpp_iproute_save(struct ap_session *ses, in_addr_t dst, int mask)
 {
-	struct vpp_route_t *saved_route = (struct vpp_route_t *)malloc(sizeof(*saved_route));
-	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
-	saved_route->af = AF_INET;
-	memcpy(&saved_route->un.ip4.dst, &dst, sizeof(dst));
-	saved_route->un.ip4.mask = mask;
-	list_add_tail(&saved_route->entry, &vpphook_data->vpp_routes);
+	vpp_route_save(ses, AF_INET, &dst, mask);
 }
 
 static void vpp_iproute_del_saved(struct ap_session *ses, in_addr_t dst, int mask)
 {
-	struct list_head *pos, *n;
-	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
-
-	list_for_each_safe(pos, n, &vpphook_data->vpp_routes) {
-		struct vpp_route_t *saved_route = list_entry(pos, typeof(*saved_route), entry);
-
-		if (saved_route->af == AF_INET && saved_route->un.ip4.dst == dst && saved_route->un.ip4.mask == mask) {
-			list_del(&saved_route->entry);
-			free(saved_route);
-		}
-	}
+	vpp_route_del_saved(ses, AF_INET, &dst, mask);
 }
 
 static void vpp_ip6route_save(struct ap_session *ses, const struct in6_addr *dst, int pref_len)
 {
-	struct vpp_route_t *saved_route = (struct vpp_route_t *)malloc(sizeof(*saved_route));
-	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
-	saved_route->af = AF_INET6;
-	memcpy(&saved_route->un.ip6.dst, dst, sizeof(*dst));
-	saved_route->un.ip6.preffix = pref_len;
-	list_add_tail(&saved_route->entry, &vpphook_data->vpp_routes);
+	vpp_route_save(ses, AF_INET6, dst, pref_len);
 }
 
 static void vpp_ip6route_del_saved(struct ap_session *ses, const struct in6_addr *dst, int pref_len)
 {
-	struct list_head *pos, *n;
+	vpp_route_del_saved(ses, AF_INET6, dst, pref_len);
+}
+
+void vpp_iproute_kernel_sync(struct ap_session *ses)
+{
 	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
+	struct vpp_route_t *saved_route;
 
-	list_for_each_safe(pos, n, &vpphook_data->vpp_routes) {
-		struct vpp_route_t *saved_route = list_entry(pos, typeof(*saved_route), entry);
+	if (!vpphook_data)
+		return;
 
-		if (saved_route->af == AF_INET6 && !memcmp(saved_route->un.ip6.dst.s6_addr, dst->s6_addr, sizeof(dst->s6_addr)) && saved_route->un.ip6.preffix == pref_len) {
-			list_del(&saved_route->entry);
-			free(saved_route);
-		}
-	}
+	pthread_mutex_lock(&vpphook_data->vpp_routes_lock);
+	list_for_each_entry(saved_route, &vpphook_data->vpp_routes, entry)
+		vpp_route_kernel_sync(saved_route);
+	pthread_mutex_unlock(&vpphook_data->vpp_routes_lock);
 }
 
 typedef struct vpp_ip_route_lookup_ctx_t {
@@ -352,13 +456,50 @@ int vpp_ip6route_add_del(struct ap_session *ses, int is_add, int ifindex, const 
 	return ret;
 }
 
-int vpp_iproute_flush(struct ap_session *ses)
+void vpp_iproute_forget(struct ap_session *ses)
 {
 	struct list_head *pos, *n;
 	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
 
+	if (!vpphook_data)
+		return;
+
+	pthread_mutex_lock(&vpphook_data->vpp_routes_lock);
+
 	list_for_each_safe(pos, n, &vpphook_data->vpp_routes) {
 		struct vpp_route_t *saved_route = list_entry(pos, typeof(*saved_route), entry);
+
+		vpp_route_kernel_del(saved_route);
+		list_del(&saved_route->entry);
+		free(saved_route);
+	}
+
+	pthread_mutex_unlock(&vpphook_data->vpp_routes_lock);
+}
+
+int vpp_iproute_flush(struct ap_session *ses)
+{
+	struct list_head *pos, *n;
+	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
+	LIST_HEAD(routes);
+
+	if (!vpphook_data)
+		return 0;
+
+	/*
+	 * Take the routes off the session first: the deletes in VPP below wait
+	 * on vpp_lock, and the list lock is not held across them. An entry the
+	 * watchdog saves after this point, and its kernel copy, are dropped by
+	 * vpp_iproute_forget() when the session is freed.
+	 */
+	pthread_mutex_lock(&vpphook_data->vpp_routes_lock);
+	list_splice_init(&vpphook_data->vpp_routes, &routes);
+	pthread_mutex_unlock(&vpphook_data->vpp_routes_lock);
+
+	list_for_each_safe(pos, n, &routes) {
+		struct vpp_route_t *saved_route = list_entry(pos, typeof(*saved_route), entry);
+
+		vpp_route_kernel_del(saved_route);
 
 		if (saved_route->af == AF_INET)
 			vpp_iproute(0, vpphook_data->vpp_sw_if_index, saved_route->un.ip4.dst, saved_route->un.ip4.mask);
