@@ -190,7 +190,6 @@ void vpp_iproute_kernel_sync(struct ap_session *ses)
 
 typedef struct vpp_ip_route_lookup_ctx_t {
 	int32_t api_retval;
-	uint32_t sw_if_index;
 	int found;
 } vpp_ip_route_lookup_ctx_t;
 
@@ -216,19 +215,18 @@ static vapi_error_e vpp_ip_route_lookup_cb(struct vapi_ctx_s *ctx,
 	return rv;
 }
 
-int vpp_ip4_host_route_present(uint32_t sw_if_index, in_addr_t dst)
+int vpp_ip4_host_route_present(uint32_t gen, in_addr_t dst)
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
 	vpp_ip_route_lookup_ctx_t lookup_ctx = {
 		.api_retval = -1,
-		.sw_if_index = sw_if_index,
 		.found = 0,
 	};
 
 	vpp_lock();
 
-	ctx = vpp_get_vapi();
+	ctx = vpp_get_vapi_gen(gen);
 	if (ctx == NULL)
 		goto exit;
 
@@ -256,14 +254,13 @@ exit:
 	return lookup_ctx.found ? 1 : 0;
 }
 
-int vpp_ip6_prefix_route_present(uint32_t sw_if_index, const struct in6_addr *dst,
+int vpp_ip6_prefix_route_present(uint32_t gen, const struct in6_addr *dst,
 				 int prefix_len)
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
 	vpp_ip_route_lookup_ctx_t lookup_ctx = {
 		.api_retval = -1,
-		.sw_if_index = sw_if_index,
 		.found = 0,
 	};
 
@@ -272,7 +269,7 @@ int vpp_ip6_prefix_route_present(uint32_t sw_if_index, const struct in6_addr *ds
 
 	vpp_lock();
 
-	ctx = vpp_get_vapi();
+	ctx = vpp_get_vapi_gen(gen);
 	if (ctx == NULL)
 		goto exit;
 
@@ -312,7 +309,7 @@ static vapi_error_e vpp_ip_ro_cb(struct vapi_ctx_s *ctx,
 	return rv;
 }
 
-static int vpp_iproute(int is_add, int ifindex, in_addr_t dst, int mask)
+static int vpp_iproute(uint32_t gen, int is_add, uint32_t ifindex, in_addr_t dst, int mask)
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
@@ -322,14 +319,19 @@ static int vpp_iproute(int is_add, int ifindex, in_addr_t dst, int mask)
 	vpp_lock();
 
 	for (attempt = 0; attempt < 3; attempt++) {
-		/* A failed attempt may have dropped the connection. */
-		ctx = vpp_get_vapi();
+		/*
+		 * A failed attempt may have dropped the connection, and the
+		 * VPP behind the next one may be another process.
+		 */
+		ctx = vpp_get_vapi_gen(gen);
 		if (ctx == NULL) {
+			err = -1;
 			goto exit;
 		}
 
 		vapi_msg_ip_route_add_del *req = vapi_alloc_ip_route_add_del(ctx, 1);
 		if (req == NULL) {
+			err = -1;
 			goto exit;
 		}
 
@@ -365,10 +367,19 @@ exit:
 	return err;
 }
 
-int vpp_iproute_add_del(struct ap_session *ses, int is_add, int ifindex, in_addr_t src,
-			in_addr_t dst, in_addr_t gw, int proto, int mask, uint32_t prio)
+int vpp_iproute_add_del(struct ap_session *ses, int is_add, in_addr_t dst, int mask)
 {
-	int ret = vpp_iproute(is_add, ifindex, dst, mask);
+	uint32_t ifindex, gen;
+	int ret;
+
+	if (!vpphook_live(ses, &ifindex, &gen)) {
+		if (is_add)
+			return -1;
+		vpp_iproute_del_saved(ses, dst, mask);
+		return 0;
+	}
+
+	ret = vpp_iproute(gen, is_add, ifindex, dst, mask);
 
 	if (is_add) {
 		if (ret == 0)
@@ -394,7 +405,8 @@ static vapi_error_e vpp_ip6_ro_cb(struct vapi_ctx_s *ctx,
 	return rv;
 }
 
-static int vpp_ip6route(int is_add, int ifindex, const struct in6_addr *dst, int pref_len)
+static int vpp_ip6route(uint32_t gen, int is_add, uint32_t ifindex, const struct in6_addr *dst,
+			int pref_len)
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
@@ -404,14 +416,16 @@ static int vpp_ip6route(int is_add, int ifindex, const struct in6_addr *dst, int
 	vpp_lock();
 
 	for (attempt = 0; attempt < 3; attempt++) {
-		/* A failed attempt may have dropped the connection. */
-		ctx = vpp_get_vapi();
+		/* see vpp_iproute() */
+		ctx = vpp_get_vapi_gen(gen);
 		if (ctx == NULL) {
+			err = -1;
 			goto exit;
 		}
 
 		vapi_msg_ip_route_add_del *req = vapi_alloc_ip_route_add_del(ctx, 1);
 		if (req == NULL) {
+			err = -1;
 			goto exit;
 		}
 
@@ -438,12 +452,22 @@ exit:
 	return err;
 }
 
-int vpp_ip6route_add_del(struct ap_session *ses, int is_add, int ifindex, const struct in6_addr *dst, int pref_len, const struct in6_addr *gw, int proto, uint32_t prio)
+int vpp_ip6route_add_del(struct ap_session *ses, int is_add, const struct in6_addr *dst, int pref_len)
 {
-	int ret = vpp_ip6route(is_add, ifindex, dst, pref_len);
+	uint32_t ifindex, gen;
+	int ret;
+
+	if (!vpphook_live(ses, &ifindex, &gen)) {
+		if (is_add)
+			return -1;
+		vpp_ip6route_del_saved(ses, dst, pref_len);
+		return 0;
+	}
+
+	ret = vpp_ip6route(gen, is_add, ifindex, dst, pref_len);
 
 	if (is_add && ret != 0 &&
-	    vpp_ip6_prefix_route_present(ifindex, dst, pref_len) == 1)
+	    vpp_ip6_prefix_route_present(gen, dst, pref_len) == 1)
 		ret = 0;
 
 	if (is_add) {
@@ -477,11 +501,29 @@ void vpp_iproute_forget(struct ap_session *ses)
 	pthread_mutex_unlock(&vpphook_data->vpp_routes_lock);
 }
 
-int vpp_iproute_flush(struct ap_session *ses)
+int vpp_route_del(uint32_t gen, uint32_t ifindex, const struct vpp_route_key *key)
+{
+	if (key->af == AF_INET) {
+		in_addr_t dst;
+
+		memcpy(&dst, key->dst, sizeof(dst));
+		return vpp_iproute(gen, 0, ifindex, dst, key->len);
+	}
+
+	return vpp_ip6route(gen, 0, ifindex, (const struct in6_addr *)key->dst, key->len);
+}
+
+int vpp_iproute_flush(struct ap_session *ses, int live, uint32_t gen, uint32_t ifindex,
+		      struct vpp_route_key **left)
 {
 	struct list_head *pos, *n;
 	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
+	struct vpp_route_key *keys = NULL, *nk;
+	int n_left = 0, ret;
 	LIST_HEAD(routes);
+
+	if (left)
+		*left = NULL;
 
 	if (!vpphook_data)
 		return 0;
@@ -501,14 +543,38 @@ int vpp_iproute_flush(struct ap_session *ses)
 
 		vpp_route_kernel_del(saved_route);
 
-		if (saved_route->af == AF_INET)
-			vpp_iproute(0, vpphook_data->vpp_sw_if_index, saved_route->un.ip4.dst, saved_route->un.ip4.mask);
+		ret = 0;
+		if (!live)
+			;
+		else if (saved_route->af == AF_INET)
+			ret = vpp_iproute(gen, 0, ifindex, saved_route->un.ip4.dst, saved_route->un.ip4.mask);
 		else if (saved_route->af == AF_INET6)
-			vpp_ip6route(0, vpphook_data->vpp_sw_if_index, &saved_route->un.ip6.dst, saved_route->un.ip6.preffix);
+			ret = vpp_ip6route(gen, 0, ifindex, &saved_route->un.ip6.dst, saved_route->un.ip6.preffix);
+
+		/*
+		 * No answer, and the VPP may still be the same: the route may
+		 * still be there. An answer of the API, even an error, or a
+		 * VPP that restarted, leaves nothing to try again.
+		 */
+		if (left && (ret > 0 || ret == -1) && vpp_generation() == gen) {
+			nk = realloc(keys, (n_left + 1) * sizeof(*keys));
+			if (nk) {
+				keys = nk;
+				memset(&keys[n_left], 0, sizeof(keys[n_left]));
+				keys[n_left].af = saved_route->af;
+				keys[n_left].len = vpp_route_len(saved_route);
+				memcpy(keys[n_left].dst, vpp_route_dst(saved_route),
+				       saved_route->af == AF_INET ? 4 : 16);
+				n_left++;
+			}
+		}
 
 		list_del(&saved_route->entry);
 		free(saved_route);
 	}
 
-	return 0;
+	if (left)
+		*left = keys;
+
+	return n_left;
 }

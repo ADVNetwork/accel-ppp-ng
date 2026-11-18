@@ -1279,6 +1279,21 @@ Specifies the action, what to do for packets that exceed the policer rule. Used 
 .TP
 .BI "vpp-violate-action=" transmit|drop
 Specifies the action to take for packets that violate the policer rule. By default is "drop" for all policer types.
+.SH [vpp]
+.br
+Connection of the module vyos_vpp to the VPP dataplane.
+.br
+The module keeps one connection to the VPP binary API and checks it every 2 seconds. Every connection asks VPP for its process id: when it is not the one of the previous connection, VPP restarted. What the sessions had in the previous VPP process (interface, routes, policers) is gone, and the same interface index may now belong to another subscriber, so those sessions are terminated at once (Acct-Terminate-Cause NAS-Reboot) and nothing of them is sent to the new VPP.
+.br
+When a session ends and VPP does not confirm that it removed the PPPoE session (the connection was lost, or VPP did not answer in time), the removal is tried again every 2 seconds, and the PPPoE session id is not given to another subscriber until VPP confirms it or restarts.
+.br
+Interface counters are read from the VPP stat segment (/run/vpp/stats.sock). While they cannot be read, a session reports the last values it read.
+.TP
+.BI "queue-size=" n
+Size of the request and response queues of the API connection (default 1024).
+.TP
+.BI "session-mtu=" 0|1
+With 1 (default) the MTU that the peer asked for in LCP (its MRU) is set on the session interface in VPP when the session comes up: a larger IPv4 packet towards the subscriber is fragmented by VPP, or answered with ICMP "fragmentation needed" when it has DF, and a larger IPv6 packet is answered with ICMPv6 "packet too big". With 0 the interface keeps the MTU that VPP gives it (9000 for a new interface): larger packets go to the peer whole.
 .SH [vpp-route-export]
 .br
 Kernel copy of the routes of VPP PPPoE sessions (module vyos_vpp), so that a routing daemon can advertise them.

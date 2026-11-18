@@ -72,137 +72,6 @@ void __export cli_show_ses_register(const char *name, const char *desc, void (*p
 	cli_show_ses_register_ex(name, desc, print, 0);
 }
 
-static struct ap_session_hooks_t *find_batch_hooks(void)
-{
-#ifdef HAVE_SESSION_HOOKS
-	struct ap_session *ses;
-	struct ap_session_hooks_t *hooks = NULL;
-
-	pthread_rwlock_rdlock(&ses_lock);
-	list_for_each_entry(ses, &ses_list, entry) {
-		if (ses->hooks && ses->hooks->stats_batch_begin) {
-			hooks = ses->hooks;
-			break;
-		}
-	}
-	pthread_rwlock_unlock(&ses_lock);
-
-	return hooks;
-#else
-	return NULL;
-#endif
-}
-
-#ifdef HAVE_SESSION_HOOKS
-/*
- * Per-session snapshot captured under ses_lock.
- * The match-key value is sampled while holding the lock so session data
- * remains stable; regex evaluation happens after the lock is released.
- */
-struct _sw_if_snapshot {
-	uint32_t sw_if_index;
-	char     match_buf[CELL_SIZE + 1];
-};
-
-/*
- * Two-phase collection of sw_if_index values.
- *
- * Phase 1 (under ses_lock): iterate sessions and snapshot sw_if_index plus
- * the optional match-key string value. No regex calls here — only _realloc
- * of a compact struct array. Lock hold time: O(N) with no regex engine.
- *
- * Phase 2 (outside ses_lock): apply pcre2_match() filter and build the final
- * index list. With 10K+ sessions and a complex pattern, keeping the regex
- * outside the lock prevents stalling new-connection setup for 50-200 ms per
- * 'show sessions' invocation.
- */
-static uint32_t *collect_sw_if_indices(struct ap_session_hooks_t *batch_hooks,
-				       struct column_t *match_key,
-				       pcre2_code *re,
-				       size_t *out_count)
-{
-	struct ap_session *ses;
-	struct _sw_if_snapshot *snap = NULL;
-	size_t snap_count  = 0;
-	size_t snap_cap    = 0;
-	uint32_t *result   = NULL;
-	size_t result_count = 0;
-
-	if (out_count)
-		*out_count = 0;
-
-	if (!batch_hooks || !batch_hooks->get_sw_if_index)
-		return NULL;
-
-	/* --- Phase 1: snapshot under lock, no regex --- */
-	pthread_rwlock_rdlock(&ses_lock);
-	list_for_each_entry(ses, &ses_list, entry) {
-		uint32_t sw_if_index = 0;
-
-		if (ses->hooks != batch_hooks)
-			continue;
-		if (batch_hooks->get_sw_if_index(ses, &sw_if_index))
-			continue;
-		if (snap_count == snap_cap) {
-			size_t next_cap = snap_cap ? snap_cap * 2 : 128;
-			struct _sw_if_snapshot *next =
-				_realloc(snap, next_cap * sizeof(*next));
-			if (!next) {
-				_free(snap);
-				snap = NULL;
-				snap_count = 0;
-				break;
-			}
-			snap = next;
-			snap_cap = next_cap;
-		}
-		snap[snap_count].sw_if_index = sw_if_index;
-		if (match_key)
-			match_key->print(ses, snap[snap_count].match_buf);
-		else
-			snap[snap_count].match_buf[0] = '\0';
-		snap_count++;
-	}
-	pthread_rwlock_unlock(&ses_lock);  /* released before any regex */
-
-	if (!snap || !snap_count)
-		goto out;
-
-	result = _malloc(snap_count * sizeof(*result));
-	if (!result)
-		goto out;
-
-	/* --- Phase 2: apply regex filter outside ses_lock --- */
-	if (re) {
-		size_t i;
-		pcre2_match_data *match_data = pcre2_match_data_create(0, NULL);
-		for (i = 0; i < snap_count; i++) {
-			if (pcre2_match(re, (PCRE2_SPTR)snap[i].match_buf,
-					strlen(snap[i].match_buf), 0, 0,
-					match_data, NULL) >= 0)
-				result[result_count++] = snap[i].sw_if_index;
-		}
-		pcre2_match_data_free(match_data);
-	} else {
-		size_t i;
-		for (i = 0; i < snap_count; i++)
-			result[result_count++] = snap[i].sw_if_index;
-	}
-
-	if (!result_count) {
-		_free(result);
-		result = NULL;
-	}
-
-out:
-	if (snap)
-		_free(snap);
-	if (out_count)
-		*out_count = result_count;
-	return result;
-}
-#endif
-
 static void show_ses_help(char * const *f, int f_cnt, void *cli)
 {
 	struct column_t *col;
@@ -278,11 +147,6 @@ static int show_ses_exec(const char *cmd, char * const *f, int f_cnt, void *cli)
 	struct ap_session *ses;
 	char *buf = NULL;
 	int match_key_f = 0, order_key_f = 0;
-	int batch_active = 0;
-	int stats_columns_present = 0;
-	uint32_t *batch_if_indices = NULL;
-	size_t batch_if_count = 0;
-	struct ap_session_hooks_t *batch_hooks = NULL;
 	LIST_HEAD(c_list);
 	LIST_HEAD(r_list);
 	LIST_HEAD(t_list);
@@ -372,49 +236,6 @@ static int show_ses_exec(const char *cmd, char * const *f, int f_cnt, void *cli)
 		list_add_tail(&col->entry, &c_list);
 	}
 
-	list_for_each_entry(col, &c_list, entry) {
-		if (col->column->uses_stats) {
-			stats_columns_present = 1;
-			break;
-		}
-	}
-
-	if (!stats_columns_present)
-		goto skip_batch;
-
-	batch_hooks = find_batch_hooks();
-
-#ifdef HAVE_SESSION_HOOKS
-	if (batch_hooks && batch_hooks->stats_batch_begin) {
-		/*
-		 * Always collect sw_if_index list for filtering.
-		 * This optimizes cache construction by only processing
-		 * interfaces that will actually be displayed.
-		 */
-		if (batch_hooks->stats_batch_set_filter) {
-			batch_if_indices = collect_sw_if_indices(
-				batch_hooks,
-				(match_key && !match_key->uses_stats) ? match_key : NULL,
-				(match_key && !match_key->uses_stats) ? re : NULL,
-				&batch_if_count);
-
-			/*
-			 * If we have a filter, use it. Otherwise batch mode
-			 * will process all interfaces (slower but necessary
-			 * when we can't pre-filter by match criteria).
-			 */
-			if (batch_if_indices && batch_if_count > 0) {
-				batch_hooks->stats_batch_set_filter(batch_if_indices, batch_if_count);
-			} else {
-				batch_hooks->stats_batch_set_filter(NULL, 0);
-			}
-		}
-		if (!batch_hooks->stats_batch_begin()) {
-			batch_active = 1;
-		}
-	}
-#endif
-skip_batch:
 
 	pthread_rwlock_rdlock(&ses_lock);
 	list_for_each_entry(ses, &ses_list, entry) {
@@ -547,12 +368,6 @@ skip_batch:
 	_free(buf);
 
 out:
-#ifdef HAVE_SESSION_HOOKS
-	if (batch_active && batch_hooks && batch_hooks->stats_batch_end)
-		batch_hooks->stats_batch_end();
-#endif
-	if (batch_if_indices)
-		_free(batch_if_indices);
 	while (!list_empty(&c_list)) {
 		col = list_entry(c_list.next, typeof(*col), entry);
 		list_del(&col->entry);
@@ -596,11 +411,6 @@ static int show_ses_exec_csv(const char *cmd, char * const *f, int f_cnt, void *
     struct ap_session *ses;
     char *buf = NULL;
     int match_key_f = 0, order_key_f = 0;
-    int batch_active = 0;
-    int stats_columns_present = 0;
-    uint32_t *batch_if_indices = NULL;
-    size_t batch_if_count = 0;
-    struct ap_session_hooks_t *batch_hooks = NULL;
     LIST_HEAD(c_list);
     LIST_HEAD(r_list);
     LIST_HEAD(t_list);
@@ -690,49 +500,6 @@ static int show_ses_exec_csv(const char *cmd, char * const *f, int f_cnt, void *
         list_add_tail(&col->entry, &c_list);
     }
 
-    list_for_each_entry(col, &c_list, entry) {
-        if (col->column->uses_stats) {
-            stats_columns_present = 1;
-            break;
-        }
-    }
-
-    if (!stats_columns_present)
-        goto skip_batch;
-
-    batch_hooks = find_batch_hooks();
-
-#ifdef HAVE_SESSION_HOOKS
-    if (batch_hooks && batch_hooks->stats_batch_begin) {
-        /*
-         * Always collect sw_if_index list for filtering.
-         * This optimizes cache construction by only processing
-         * interfaces that will actually be displayed.
-         */
-        if (batch_hooks->stats_batch_set_filter) {
-            batch_if_indices = collect_sw_if_indices(
-                batch_hooks,
-                (match_key && !match_key->uses_stats) ? match_key : NULL,
-                (match_key && !match_key->uses_stats) ? re : NULL,
-                &batch_if_count);
-
-            /*
-             * If we have a filter, use it. Otherwise batch mode
-             * will process all interfaces (slower but necessary
-             * when we can't pre-filter by match criteria).
-             */
-            if (batch_if_indices && batch_if_count > 0) {
-                batch_hooks->stats_batch_set_filter(batch_if_indices, batch_if_count);
-            } else {
-                batch_hooks->stats_batch_set_filter(NULL, 0);
-            }
-        }
-        if (!batch_hooks->stats_batch_begin()) {
-            batch_active = 1;
-        }
-    }
-#endif
-skip_batch:
 
     pthread_rwlock_rdlock(&ses_lock);
     list_for_each_entry(ses, &ses_list, entry) {
@@ -832,12 +599,6 @@ skip_batch:
     _free(buf);
 
 out:
-#ifdef HAVE_SESSION_HOOKS
-    if (batch_active && batch_hooks && batch_hooks->stats_batch_end)
-        batch_hooks->stats_batch_end();
-#endif
-    if (batch_if_indices)
-        _free(batch_if_indices);
     while (!list_empty(&c_list)) {
         col = list_entry(c_list.next, typeof(*col), entry);
         list_del(&col->entry);

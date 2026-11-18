@@ -39,9 +39,18 @@
  *
  * pppoe_session_dump answers with a wrong message id in adv-vpp builds
  * before the fix in pppoe_api.c (msg_id_base missing since the original
- * plugin): the client gets garbage or nothing. So the pppoeN interfaces are
- * also taken from sw_interface_dump, and at the end no visible pppoeN may be
- * left. Each deleted session leaves its pppoeN hidden, kept by VPP for reuse.
+ * plugin; adv-vpp v1.0.x still has it). The details arrive under the id of
+ * a message this client does not know, and VAPI looks that id up in a table
+ * it never initialised: with luck the fields come swapped as another
+ * message, without it accel-pppd aborts on an assert inside libvapiclient.
+ * So the dump is only asked to a VPP that proves it has the change that fixed
+ * it (rec_dump_trusted()). Any other VPP is told to drop every PPPoE session
+ * by its CLI ("delete pppoe sessions", through cli_inband), which stops the
+ * workers for the whole command instead of once per session.
+ *
+ * In both cases the pppoeN interfaces are also taken from sw_interface_dump,
+ * and at the end no visible pppoeN may be left. Each deleted session leaves
+ * its pppoeN hidden, kept by VPP for reuse.
  *
  * Runs with vpp_lock held, from vpppoe_connect_to_vpp().
  */
@@ -53,12 +62,14 @@
 #include <vapi/ip.api.vapi.h>
 #include <vapi/policer.api.vapi.h>
 #include <vapi/fib.api.vapi.h>
+#include <vapi/vlib.api.vapi.h>
 
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "log.h"
 
@@ -83,6 +94,9 @@ DEFINE_VAPI_MSG_IDS_FIB_API_JSON
 static int rec_api_src = -1;	/* FIB source id, -1 = not asked yet */
 static int rec_routes_done;	/* a pass removed every orphan route */
 static int rec_policers_done;	/* a pass removed every policer of ours */
+/* pid of the VPP that was asked whether its session dump is good, and the answer */
+static uint32_t rec_dump_pid;
+static int rec_dump_ok;
 
 struct rec_session {
 	uint32_t sw_if_index;
@@ -296,6 +310,109 @@ static int rec_del_pppoe(const struct rec_session *s)
 		ret = 0;
 
 	return ret;
+}
+
+/*
+ * Can pppoe_session_dump of this VPP be used? The fix of the dump came in
+ * the same adv-vpp change that made the session add refuse the reserved
+ * session ids (0 and 0xffff) before anything else, and nothing in the API
+ * says which one a VPP has (same .api, same CRC). So ask for a session with
+ * id 0xffff and a MAC nobody has:
+ *
+ *  - INVALID_VALUE: the id was refused, the VPP has that change;
+ *  - anything else (INVALID_SW_IF_INDEX: the MAC is not in the link table,
+ *    the answer of a VPP without the change): the dump is not used.
+ *
+ * Nothing is created either way: the MAC is random and locally administered,
+ * and should a VPP make the session all the same, it is deleted right here.
+ *
+ * Returns 1 = good, 0 = not to be used, -1 = no answer.
+ */
+static int rec_dump_trusted(void)
+{
+	struct vapi_ctx_s *ctx = rec_ctx();
+	struct vpp_vapi_reply_ctx reply_ctx = { 0, NULL };
+	vapi_msg_pppoe_add_del_session *req;
+	struct rec_session probe;
+	struct timespec ts;
+	vapi_error_e err;
+	uint64_t r;
+	int ret;
+
+	if (!ctx)
+		return -1;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	r = ((uint64_t)ts.tv_nsec * 2654435761u) ^ ((uint64_t)ts.tv_sec << 20) ^ ((uint64_t)getpid() << 32);
+
+	memset(&probe, 0, sizeof(probe));
+	probe.session_id = 0xffff;
+	probe.client_mac[0] = 0x02;	/* locally administered, unicast */
+	memcpy(probe.client_mac + 1, &r, 5);
+	probe.client_ip.af = ADDRESS_IP4;
+
+	req = vapi_alloc_pppoe_add_del_session(ctx);
+	if (!req)
+		return -1;
+
+	req->payload.is_add = 1;
+	req->payload.session_id = probe.session_id;
+	req->payload.client_ip = probe.client_ip;
+	memcpy(req->payload.client_mac, probe.client_mac, sizeof(probe.client_mac));
+	req->payload.disable_fib = 1;
+
+	err = vapi_pppoe_add_del_session(ctx, req, rec_pppoe_del_cb, &reply_ctx);
+	err = vpp_vapi_complete(err);
+	if (err != VAPI_OK)
+		return -1;
+
+	ret = reply_ctx.api_retval;
+	if (ret == 0) {
+		log_error("vpp: reconcile: VPP made a session for the probe (sid 0xffff), deleting it\n");
+		rec_del_pppoe(&probe);
+		return rec_ctx() ? 0 : -1;
+	}
+
+	return ret == VPP_API_ERR_INVALID_VALUE;
+}
+
+static vapi_error_e rec_cli_cb(struct vapi_ctx_s *ctx, void *cb_ctx,
+			       vapi_error_e rv, bool is_last,
+			       vapi_payload_cli_inband_reply *reply)
+{
+	struct vpp_vapi_reply_ctx *reply_ctx = cb_ctx;
+
+	if (rv == VAPI_OK && reply_ctx && reply)
+		reply_ctx->api_retval = reply->retval;
+
+	return rv;
+}
+
+/*
+ * "delete pppoe sessions" in the VPP CLI: every PPPoE session, whoever made
+ * it. VPP keeps the workers stopped for the whole command.
+ */
+static int rec_cli_delete_sessions(void)
+{
+	static const char cmd[] = "delete pppoe sessions";
+	struct vapi_ctx_s *ctx = rec_ctx();
+	struct vpp_vapi_reply_ctx reply_ctx = { 0, NULL };
+	vapi_msg_cli_inband *req;
+	vapi_error_e err;
+
+	if (!ctx)
+		return -1;
+
+	req = vapi_alloc_cli_inband(ctx, sizeof(cmd) - 1);
+	if (!req)
+		return -1;
+
+	memcpy(req->payload.cmd.buf, cmd, sizeof(cmd) - 1);
+
+	err = vapi_cli_inband(ctx, req, rec_cli_cb, &reply_ctx);
+	err = vpp_vapi_complete(err);
+
+	return vpp_vapi_errno(err, &reply_ctx);
 }
 
 /* ---- Interfaces -------------------------------------------------------- */
@@ -758,7 +875,24 @@ static int rec_collect(struct rec_state *st)
 		log_error("vpp: reconcile: sw_interface_dump failed\n");
 		return -1;
 	}
-	if (rec_dump_pppoe(st)) {
+
+	/* Once per VPP process: does it have a session dump that can be used? */
+	if (rec_dump_pid != vpp_instance_pid()) {
+		int ok = rec_dump_trusted();
+
+		if (ok < 0) {
+			log_error("vpp: reconcile: no answer to the pppoe session probe\n");
+			return -1;
+		}
+		rec_dump_ok = ok;
+		rec_dump_pid = vpp_instance_pid();
+		if (!ok)
+			log_warn("vpp: reconcile: this VPP does not have the pppoe_session_dump fix: "
+				 "orphan sessions are removed with its CLI (workers stopped for the command)\n");
+	}
+
+	/* Without sessions there is nothing to list, and nothing to go wrong. */
+	if (rec_dump_ok && st->n_pppoe_if && rec_dump_pppoe(st)) {
 		log_error("vpp: reconcile: pppoe_session_dump failed\n");
 		return -1;
 	}
@@ -875,6 +1009,18 @@ int vpp_reconcile_orphans(void)
 		rec_progress(&progress, "pppoe session(s)", i + 1, st.n_ses);
 	}
 
+	/* A VPP whose dump is not used: every session at once, by its CLI. */
+	if (!rec_dump_ok && st.n_pppoe_if) {
+		ret = rec_cli_delete_sessions();
+		if (!rec_ctx())
+			goto lost;
+		if (ret)
+			log_error("vpp: reconcile: 'delete pppoe sessions' failed ret=%d\n", ret);
+		else
+			log_warn("vpp: reconcile: VPP was told to delete every pppoe session "
+				 "('delete pppoe sessions'), %zu pppoe interface(s) were up\n", st.n_pppoe_if);
+	}
+
 	log_warn("vpp: reconcile: removed %zu pppoe session(s), %zu ipv4 and %zu ipv6 route(s), "
 		 "%zu policer(s); failed %zu, %zu, %zu\n",
 		 st.n_ses - err_sessions, n_v4, n_v6, st.n_policers - err_policers,
@@ -899,9 +1045,8 @@ int vpp_reconcile_orphans(void)
 		return -1;
 	}
 	if (st.n_pppoe_if) {
-		log_error("vpp: reconcile: %zu pppoe interface(s) still up in VPP. If the VPP lists no "
-			  "pppoe session through the API (adv-vpp without the pppoe_session_dump fix), "
-			  "remove them with 'vppctl delete pppoe sessions'\n", st.n_pppoe_if);
+		log_error("vpp: reconcile: %zu pppoe interface(s) still up in VPP after the cleanup; "
+			  "'vppctl delete pppoe sessions' removes them by hand\n", st.n_pppoe_if);
 		rec_free(&st);
 		return -1;
 	}

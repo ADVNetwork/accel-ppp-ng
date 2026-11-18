@@ -11,6 +11,8 @@
 #include <stdio.h>
 
 #include "ap_session.h"
+#include "ppp.h"
+#include "log.h"
 #include "triton.h"
 #include "events.h"
 #include "vpputils.h"
@@ -20,8 +22,6 @@
 #include "vpppolicer.h"
 
 DEFINE_VAPI_MSG_IDS_POLICER_API_JSON
-
-#define POLICER_NAME_MAX_LEN 64
 
 static uint32_t s_vpp_policer_type = SSE2_QOS_POLICER_TYPE_API_2R3C_RFC_2698;
 static double s_cir_factor = 0.8;
@@ -33,22 +33,28 @@ static uint32_t s_exceed_action = SSE2_QOS_ACTION_API_TRANSMIT;
 static uint32_t s_violate_action = SSE2_QOS_ACTION_API_DROP;
 
 static vapi_error_e vpppolicer_set_input_callback(struct vapi_ctx_s *ctx,
-												void *callback_ctx,
-												vapi_error_e rv,
-												bool is_last,
-												vapi_payload_policer_input_reply *reply)
+						  void *callback_ctx,
+						  vapi_error_e rv,
+						  bool is_last,
+						  vapi_payload_policer_input_reply *reply)
 {
+	struct vpp_vapi_reply_ctx *reply_ctx = callback_ctx;
+
+	if (rv == VAPI_OK && reply_ctx && reply)
+		reply_ctx->api_retval = reply->retval;
+
 	return rv;
 }
 
-int vpppolicer_set_input(int is_add, uint32_t ifindex, const char *policer_name)
+static int vpppolicer_set_input(uint32_t gen, int is_add, uint32_t ifindex, const char *policer_name)
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
+	struct vpp_vapi_reply_ctx reply_ctx = { 0, NULL };
 
 	vpp_lock();
 
-	ctx = vpp_get_vapi();
+	ctx = vpp_get_vapi_gen(gen);
 	if (ctx == NULL) {
 		goto exit;
 	}
@@ -63,8 +69,9 @@ int vpppolicer_set_input(int is_add, uint32_t ifindex, const char *policer_name)
 	req->payload.name[sizeof(req->payload.name) - 1] = 0;
 	req->payload.sw_if_index = ifindex;
 
-	err = vapi_policer_input(ctx, req, vpppolicer_set_input_callback, NULL);
+	err = vapi_policer_input(ctx, req, vpppolicer_set_input_callback, &reply_ctx);
 	err = vpp_vapi_complete(err);
+	err = vpp_vapi_errno(err, &reply_ctx);
 
 exit:
 	vpp_unlock();
@@ -72,22 +79,28 @@ exit:
 }
 
 static vapi_error_e vpppolicer_set_output_callback(struct vapi_ctx_s *ctx,
-												void *callback_ctx,
-												vapi_error_e rv,
-												bool is_last,
-												vapi_payload_policer_output_reply *reply)
+						   void *callback_ctx,
+						   vapi_error_e rv,
+						   bool is_last,
+						   vapi_payload_policer_output_reply *reply)
 {
+	struct vpp_vapi_reply_ctx *reply_ctx = callback_ctx;
+
+	if (rv == VAPI_OK && reply_ctx && reply)
+		reply_ctx->api_retval = reply->retval;
+
 	return rv;
 }
 
-int vpppolicer_set_output(int is_add, uint32_t ifindex, const char *policer_name)
+static int vpppolicer_set_output(uint32_t gen, int is_add, uint32_t ifindex, const char *policer_name)
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
+	struct vpp_vapi_reply_ctx reply_ctx = { 0, NULL };
 
 	vpp_lock();
 
-	ctx = vpp_get_vapi();
+	ctx = vpp_get_vapi_gen(gen);
 	if (ctx == NULL) {
 		goto exit;
 	}
@@ -102,8 +115,9 @@ int vpppolicer_set_output(int is_add, uint32_t ifindex, const char *policer_name
 	req->payload.name[sizeof(req->payload.name) - 1] = 0;
 	req->payload.sw_if_index = ifindex;
 
-	err = vapi_policer_output(ctx, req, vpppolicer_set_output_callback, NULL);
+	err = vapi_policer_output(ctx, req, vpppolicer_set_output_callback, &reply_ctx);
 	err = vpp_vapi_complete(err);
+	err = vpp_vapi_errno(err, &reply_ctx);
 
 exit:
 	vpp_unlock();
@@ -111,22 +125,28 @@ exit:
 }
 
 static vapi_error_e vpppolicer_add_del_callback(struct vapi_ctx_s *ctx,
-												void *callback_ctx,
-												vapi_error_e rv,
-												bool is_last,
-												vapi_payload_policer_add_del_reply *reply)
+						void *callback_ctx,
+						vapi_error_e rv,
+						bool is_last,
+						vapi_payload_policer_add_del_reply *reply)
 {
+	struct vpp_vapi_reply_ctx *reply_ctx = callback_ctx;
+
+	if (rv == VAPI_OK && reply_ctx && reply)
+		reply_ctx->api_retval = reply->retval;
+
 	return rv;
 }
 
-static int vpppolicer_add_del(int is_add, const char *policer_name, uint32_t cir_kbits, uint64_t cb_bits)
+static int vpppolicer_add_del(uint32_t gen, int is_add, const char *policer_name, uint32_t cir_kbits, uint64_t cb_bits)
 {
 	vapi_error_e err = -1;
 	struct vapi_ctx_s *ctx;
+	struct vpp_vapi_reply_ctx reply_ctx = { 0, NULL };
 
 	vpp_lock();
 
-	ctx = vpp_get_vapi();
+	ctx = vpp_get_vapi_gen(gen);
 	if (ctx == NULL) {
 		goto exit;
 	}
@@ -155,17 +175,65 @@ static int vpppolicer_add_del(int is_add, const char *policer_name, uint32_t cir
 
 	req->payload.color_aware = 0;
 
-	err = vapi_policer_add_del(ctx, req, vpppolicer_add_del_callback, NULL);
+	err = vapi_policer_add_del(ctx, req, vpppolicer_add_del_callback, &reply_ctx);
 	err = vpp_vapi_complete(err);
+	err = vpp_vapi_errno(err, &reply_ctx);
 
 exit:
 	vpp_unlock();
 	return err;
 }
 
-static void vpppolicer_generate_name(char *name, size_t size, struct ap_session *ses, uint32_t rate, uint64_t burst, int is_up)
+/*
+ * Delete a policer by name. policer_del in adv-vpp also takes the policer
+ * off the interfaces it is applied to. 0 also when VPP has no such policer.
+ */
+int vpppolicer_del_name(uint32_t gen, const char *policer_name)
 {
-	snprintf(name, size, "vyos_%d_%d_%ld_%s", vpphook_get_pd(ses)->vpp_sw_if_index, rate, burst, is_up ? "up" : "down");
+	int ret = vpppolicer_add_del(gen, 0, policer_name, 0, 0);
+
+	return ret == VPP_API_ERR_NO_SUCH_ENTRY ? 0 : ret;
+}
+
+void vpppolicer_format_name(char *name, size_t size, uint32_t sw_if_index, uint32_t rate, uint64_t burst, int is_up)
+{
+	/* vppreconcile.c (rec_policer_ours) recognises this format */
+	snprintf(name, size, "vyos_%u_%u_%lu_%s", sw_if_index, rate, (unsigned long)burst, is_up ? "up" : "down");
+}
+
+/*
+ * Make the policer and apply it to the interface. Any answer of VPP other
+ * than success leaves nothing behind and fails: before, the answers were not
+ * read, and a session whose policer VPP refused ran without any limit.
+ */
+static int vpppolicer_apply(uint32_t gen, uint32_t ifindex, const char *name, uint32_t rate, uint64_t burst, int is_up)
+{
+	int ret;
+
+	/* from now on the name is of this session, not a leftover to delete */
+	vpphook_deferred_forget_policer(gen, name);
+
+	ret = vpppolicer_add_del(gen, 1, name, rate, burst);
+	if (ret == VPP_API_ERR_VALUE_EXIST) {
+		/*
+		 * Left by a session that had this interface before and could
+		 * not remove it. Same rate and burst, but the type and the
+		 * factors may be others: make it again.
+		 */
+		vpppolicer_del_name(gen, name);
+		ret = vpppolicer_add_del(gen, 1, name, rate, burst);
+	}
+	if (ret)
+		return ret;
+
+	ret = is_up ? vpppolicer_set_input(gen, 1, ifindex, name) :
+		      vpppolicer_set_output(gen, 1, ifindex, name);
+	if (ret) {
+		vpppolicer_del_name(gen, name);
+		return ret;
+	}
+
+	return 0;
 }
 
 int vpppolicer_install_limiter(struct ap_session *ses, int down_speed, int down_burst, int up_speed, int up_burst)
@@ -173,7 +241,12 @@ int vpppolicer_install_limiter(struct ap_session *ses, int down_speed, int down_
 	int ret = 0;
 	char policer_input[POLICER_NAME_MAX_LEN] = {};
 	char policer_output[POLICER_NAME_MAX_LEN] = {};
-	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
+	struct vpphook_private_data_t *vpphook_data;
+	uint32_t ifindex, gen;
+
+	vpphook_data = vpphook_live(ses, &ifindex, &gen);
+	if (!vpphook_data)
+		return -1;
 
 	/* convert rate to kbits/s and burst to bits */
 	down_speed = down_speed * 8 / 1000;
@@ -185,11 +258,10 @@ int vpppolicer_install_limiter(struct ap_session *ses, int down_speed, int down_
 	vpppolicer_remove_limiter(ses);
 
 	if (down_speed) {
-		vpppolicer_generate_name(policer_output, POLICER_NAME_MAX_LEN - 1, ses, down_speed, down_burst, 0);
-		vpppolicer_add_del(1, policer_output, down_speed, down_burst);
-		ret = vpppolicer_set_output(1, vpphook_data->vpp_sw_if_index, policer_output);
+		vpppolicer_format_name(policer_output, sizeof(policer_output), ifindex, down_speed, down_burst, 0);
+		ret = vpppolicer_apply(gen, ifindex, policer_output, down_speed, down_burst, 0);
 		if (ret) {
-			vpppolicer_add_del(0, policer_output, down_speed, down_burst);
+			log_ppp_error("vpp: download policer %s refused by VPP, ret=%d\n", policer_output, ret);
 			goto exit;
 		}
 
@@ -198,19 +270,17 @@ int vpppolicer_install_limiter(struct ap_session *ses, int down_speed, int down_
 	}
 
 	if (up_speed) {
-		vpppolicer_generate_name(policer_input, POLICER_NAME_MAX_LEN - 1, ses, up_speed, up_burst, 1);
-		vpppolicer_add_del(1, policer_input, up_speed, up_burst);
-		ret = vpppolicer_set_input(1, vpphook_data->vpp_sw_if_index, policer_input);
+		vpppolicer_format_name(policer_input, sizeof(policer_input), ifindex, up_speed, up_burst, 1);
+		ret = vpppolicer_apply(gen, ifindex, policer_input, up_speed, up_burst, 1);
 		if (ret) {
-			vpppolicer_add_del(0, policer_input, up_speed, up_burst);
-			if (down_speed) {
-				vpppolicer_set_output(0, vpphook_data->vpp_sw_if_index, policer_output);
-				vpppolicer_add_del(0, policer_output, down_speed, down_burst);
-				vpphook_data->vpppolicer_down = 0;
-				vpphook_data->vpppolicer_down_burst = 0;
-			}
+			log_ppp_error("vpp: upload policer %s refused by VPP, ret=%d\n", policer_input, ret);
+			/* no half limiter: the caller is told the install failed */
+			vpppolicer_remove_limiter(ses);
 			goto exit;
 		}
+
+		vpphook_data->vpppolicer_up = up_speed;
+		vpphook_data->vpppolicer_up_burst = up_burst;
 
 		/*
 		 * VPP's policer_input() API (src/vnet/policer/policer.c) already
@@ -220,36 +290,55 @@ int vpppolicer_install_limiter(struct ap_session *ses, int down_speed, int down_
 		 * with the feature twice (API + manual), policing every packet twice
 		 * against the same token bucket and dropping ~all conformed traffic.
 		 */
-		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 1, "policer-input", "ip4-multicast");
-		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 1, "policer-input", "ip6-multicast");
-
-		vpphook_data->vpppolicer_up = up_speed;
-		vpphook_data->vpppolicer_up_burst = up_burst;
+		if (vpppoe_set_feature(gen, ifindex, 1, "policer-input", "ip4-multicast") ||
+		    vpppoe_set_feature(gen, ifindex, 1, "policer-input", "ip6-multicast"))
+			log_ppp_warn("vpp: upload policer %s not applied to multicast\n", policer_input);
 	}
 
 exit:
 	return ret;
 }
 
+/*
+ * Take the limiter off the session interface. Both directions are always
+ * tried; the first error is returned. A direction that could not be removed
+ * stays recorded in the session, for vpppolicer_leftover().
+ */
 int vpppolicer_remove_limiter(struct ap_session *ses)
 {
-	int ret = 0;
-	char policer_input[64] = {};
-	char policer_output[64] = {};
+	int ret = 0, r;
+	char policer_input[POLICER_NAME_MAX_LEN] = {};
+	char policer_output[POLICER_NAME_MAX_LEN] = {};
 	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
+	uint32_t ifindex, gen;
 
-	if (vpphook_data->vpppolicer_down) {
-		vpppolicer_generate_name(policer_output, POLICER_NAME_MAX_LEN - 1, ses, vpphook_data->vpppolicer_down, vpphook_data->vpppolicer_down_burst, 0);
-		ret = vpppolicer_set_output(0, vpphook_data->vpp_sw_if_index, policer_output);
-		if (ret)
-			goto exit;
-		vpppolicer_add_del(0, policer_output, vpphook_data->vpppolicer_down, vpphook_data->vpppolicer_down_burst);
+	if (!vpphook_data)
+		return 0;
+
+	if (!vpphook_live(ses, &ifindex, &gen)) {
+		/* the policers of a VPP that restarted went away with it */
 		vpphook_data->vpppolicer_down = 0;
 		vpphook_data->vpppolicer_down_burst = 0;
+		vpphook_data->vpppolicer_up = 0;
+		vpphook_data->vpppolicer_up_burst = 0;
+		return 0;
+	}
+
+	if (vpphook_data->vpppolicer_down) {
+		vpppolicer_format_name(policer_output, sizeof(policer_output), ifindex, vpphook_data->vpppolicer_down, vpphook_data->vpppolicer_down_burst, 0);
+		/* the unapply answers 0 also when the policer is not applied */
+		vpppolicer_set_output(gen, 0, ifindex, policer_output);
+		r = vpppolicer_del_name(gen, policer_output);
+		if (r == 0) {
+			vpphook_data->vpppolicer_down = 0;
+			vpphook_data->vpppolicer_down_burst = 0;
+		} else {
+			ret = r;
+		}
 	}
 
 	if (vpphook_data->vpppolicer_up) {
-		vpppolicer_generate_name(policer_input, POLICER_NAME_MAX_LEN - 1, ses, vpphook_data->vpppolicer_up, vpphook_data->vpppolicer_up_burst, 1);
+		vpppolicer_format_name(policer_input, sizeof(policer_input), ifindex, vpphook_data->vpppolicer_up, vpphook_data->vpppolicer_up_burst, 1);
 
 		/*
 		 * Disable all feature arcs BEFORE clearing the policer index and
@@ -273,20 +362,48 @@ int vpppolicer_remove_limiter(struct ap_session *ses)
 		 * ip6-unicast (matching the enable path), so only the multicast arcs
 		 * need to be disabled manually here.
 		 */
-		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 0, "policer-input", "ip4-multicast");
-		vpppoe_set_feature(vpphook_data->vpp_sw_if_index, 0, "policer-input", "ip6-multicast");
+		vpppoe_set_feature(gen, ifindex, 0, "policer-input", "ip4-multicast");
+		vpppoe_set_feature(gen, ifindex, 0, "policer-input", "ip6-multicast");
 
-		ret = vpppolicer_set_input(0, vpphook_data->vpp_sw_if_index, policer_input);
-		if (ret)
-			goto exit;
-		vpppolicer_add_del(0, policer_input, vpphook_data->vpppolicer_up, vpphook_data->vpppolicer_up_burst);
+		vpppolicer_set_input(gen, 0, ifindex, policer_input);
+		r = vpppolicer_del_name(gen, policer_input);
+		if (r == 0) {
+			vpphook_data->vpppolicer_up = 0;
+			vpphook_data->vpppolicer_up_burst = 0;
+		} else if (!ret) {
+			ret = r;
+		}
+	}
 
+	return ret;
+}
+
+/*
+ * Names of the policers that vpppolicer_remove_limiter() could not remove,
+ * for the deferred cleanup (vpphooks.c); the session forgets them. Returns
+ * how many names were written (0 to 2).
+ */
+int vpppolicer_leftover(struct ap_session *ses, uint32_t ifindex, char names[2][POLICER_NAME_MAX_LEN])
+{
+	struct vpphook_private_data_t *vpphook_data = vpphook_get_pd(ses);
+	int n = 0;
+
+	if (!vpphook_data)
+		return 0;
+
+	if (vpphook_data->vpppolicer_down) {
+		vpppolicer_format_name(names[n++], POLICER_NAME_MAX_LEN, ifindex, vpphook_data->vpppolicer_down, vpphook_data->vpppolicer_down_burst, 0);
+		vpphook_data->vpppolicer_down = 0;
+		vpphook_data->vpppolicer_down_burst = 0;
+	}
+
+	if (vpphook_data->vpppolicer_up) {
+		vpppolicer_format_name(names[n++], POLICER_NAME_MAX_LEN, ifindex, vpphook_data->vpppolicer_up, vpphook_data->vpppolicer_up_burst, 1);
 		vpphook_data->vpppolicer_up = 0;
 		vpphook_data->vpppolicer_up_burst = 0;
 	}
 
-exit:
-	return ret;
+	return n;
 }
 
 static uint32_t vpppolicer_parse_action(const char *opt)

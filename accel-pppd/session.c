@@ -427,8 +427,28 @@ int __export ap_session_read_stats(struct ap_session *ses, struct rtnl_link_stat
 		stats = &lstats;
 
 #ifdef HAVE_SESSION_HOOKS
-	if (ses->hooks && ses->hooks->read_stats)
-		ret = ses->hooks->read_stats(ses, stats);
+	if (ses->hooks && ses->hooks->read_stats) {
+		if (ses->hooks->read_stats(ses, stats)) {
+			/*
+			 * The dataplane cannot give the counters now: it is
+			 * restarting, or the session was made in a dataplane
+			 * that restarted since. That says nothing about the
+			 * session, and there is no kernel interface to ask.
+			 * Answer with the last values read: accounting never
+			 * goes back, and no caller acts on what it did not
+			 * read. The idle clock does not run on a session that
+			 * cannot be measured.
+			 */
+			memset(stats, 0, sizeof(*stats));
+			stats->rx_packets = ses->acct_rx_packets;
+			stats->tx_packets = ses->acct_tx_packets;
+			stats->rx_bytes = ses->acct_rx_bytes;
+			stats->tx_bytes = ses->acct_tx_bytes;
+			ses->idle_time = _time();
+			return 0;
+		}
+		ret = 0;
+	}
 #endif
 
 	if (ret) {

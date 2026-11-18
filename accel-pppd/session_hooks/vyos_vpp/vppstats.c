@@ -1,920 +1,665 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Copyright (c) 2025 by VyOS Networks
+ * Interface counters and names from the VPP stat segment.
+ *
+ * VPP publishes its counters in a shared memory segment that clients map
+ * read-only. A writer in VPP sets in_progress, changes the segment, bumps the
+ * epoch and clears in_progress; a reader takes no lock, reads, and at the end
+ * checks that the epoch did not move. Until that check, everything the reader
+ * saw may be half-written or already freed: the directory vector and the
+ * counter vectors are moved by VPP whenever they grow (a new interface, a new
+ * graph node, a new thread).
+ *
+ * The VPP client library (stat_client.c) walks those vectors trusting the
+ * lengths and pointers it finds, and only then checks the epoch. A vector
+ * moved under it leaves a garbage length, and the walk runs off the end of
+ * the mapping: accel-pppd died like that in stat_segment_ls_r() while
+ * thousands of sessions came up on a freshly started VPP, every one of them
+ * a new interface. This file does not use that library. It maps the segment
+ * itself and:
+ *
+ *  - never follows a pointer or a length read from the segment without
+ *    checking that the whole object is inside the mapping. A torn read gives
+ *    a wrong number at worst, and the epoch check throws it away;
+ *  - reads only what it needs: two counters per thread for one interface,
+ *    instead of a copy of the counters of every interface;
+ *  - finds /if/rx, /if/tx and /if/names by name once per mapping, without
+ *    regular expressions, and then checks the name on every use;
+ *  - bounds every wait: on the stat socket, for a VPP writer, and the number
+ *    of retries.
+ *
+ * A mapping belongs to one VPP process, known by its pid (SO_PEERCRED on the
+ * stat socket). Callers say which VPP process they want the counters of (the
+ * one that created the interface, vpputils.c), so a session created in a VPP
+ * that restarted since is never answered with the counters that another
+ * interface has under the same sw_if_index in the new VPP.
+ *
+ * The mapping of a VPP that is gone must not be kept: the segment lives in
+ * hugepages, and they stay taken for as long as anyone maps it. A VPP that
+ * restarts needs every hugepage of the old one (the pool is sized for one
+ * VPP): with a few of them held here, its DPDK could not start the NIC and
+ * VPP came up with no interface (lab, 2026-11-18). So the mapping is dropped
+ * the moment the VPP process exits or the API connection is lost
+ * (vpp_stats_drop()), and made again by the next read.
+ *
+ * There is no cache and no batch mode: reading one interface costs a few
+ * dozen memory loads, so "show sessions" reads each session like every other
+ * caller does.
  */
 
 #include <linux/if_link.h>
 #include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/inotify.h>
-#include <poll.h>
-#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 
-#include <vpp-api/client/stat_client.h>
 #include <vppinfra/types.h>
 #include <vppinfra/vec.h>
+#include <vlib/stats/shared.h>
+#include <vlib/counter_types.h>
 
 #include "triton.h"
-#include "vpphooks.h"
-#include "vppstats.h"
+#include "ap_session.h"
 #include "log.h"
-#include "memdebug.h"
 
-/* Maximum cache size: 1M entries = ~32MB max memory usage */
-#define MAX_VPP_STATS_CACHE_SIZE (1024 * 1024)
+#include "vpphooks.h"
+#include "vpputils.h"
+#include "vppstats.h"
+
+#define VS_SOCKET_FILE "/run/vpp/stats.sock"
+/* STAT_SEGMENT_VERSION (vlib/stats/stats.h) of the layout read here */
+#define VS_SEGMENT_VERSION 2
+
+/* A vppinfra vector keeps its length in a u32, 8 bytes before the data. */
+#define VS_VEC_HDR 8
+_Static_assert(sizeof(vec_header_t) == VS_VEC_HDR && offsetof(vec_header_t, len) == 0,
+	       "vppinfra vector header changed: review vppstats.c");
+
+/* Wait on the stat socket (connect and the answer with the segment). */
+#define VS_SOCKET_TIMEOUT_MS 1000
+/* Seconds between two attempts to map the segment. */
+#define VS_CONNECT_RETRY_SEC 1
+/* Total time of one read (waiting for a VPP writer and trying), and its tries. */
+#define VS_WRITER_WAIT_MS 200
+#define VS_MAX_ATTEMPTS 32
 /*
- * Sanity limit for sw_if_index to prevent excessive memory allocation.
- * VPP typically uses sequential interface indices, so if we see indices
- * above this threshold, something is likely wrong or the VPP instance
- * has been running for a very long time without recycling IDs.
- * At 100K indices, we'd allocate ~3.2MB for the cache array.
+ * Reads of an unchanged segment that fail in a row before its layout is
+ * taken as unknown, and seconds without reading it after that.
  */
-#define MAX_SANE_SW_IF_INDEX (100 * 1000)
+#define VS_STABLE_FAILS 3
+#define VS_UNREADABLE_RETRY_SEC 2
+/* Seconds between two log lines about a segment that cannot be read. */
+#define VS_LOG_INTERVAL_SEC 60
+/* Sanity limits for what the segment says. */
+#define VS_MAX_THREADS 1024
+#define VS_MAX_INTERFACES (1U << 20)
+#define VS_IF_NAME_LEN 64
 
-static pthread_mutex_t vpp_stats_lock = PTHREAD_MUTEX_INITIALIZER;
-static int vpp_stats_connected;
-static pthread_rwlock_t vpp_stats_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
-static int vpp_stats_batch_active;  /* Changed from __thread to global - protected by vpp_stats_cache_lock */
-static uint32_t *vpp_stats_filter;
-static size_t vpp_stats_filter_len;
-/* Serializes the batch begin/end pair: prevents two concurrent CLI commands
- * from corrupting each other's cache snapshot. Held from stats_batch_begin
- * until stats_batch_end. */
-static pthread_mutex_t vpp_stats_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/*
- * Cached result of stat_segment_ls() for the four standard interface counters.
- * Protected by vpp_stats_lock. Populated once per VPP connection; cleared on
- * disconnect. Eliminates per-session regex (regexec via stat_segment_ls_r) from
- * the hot disconnect path: with N sessions terminating, this reduces the cost
- * from N×stat_segment_ls() to a single call.
- */
-static u32 *vpp_stats_if_dir = NULL;
-
-/*
- * Short-lived cache of the last stat_segment_dump() result.
- * Protected by vpp_stats_lock.
- *
- * During mass disconnect (e.g. 4000 sessions terminating within milliseconds),
- * every session calls vpp_stats_read_interface() individually. Without caching,
- * this causes N×stat_segment_dump() calls, each of which requires VPP worker
- * threads to synchronize hardware counters — the source of the 14% CPU shown
- * by vlib_worker_thread_fn in perf top.
- *
- * A 200ms TTL is safe because: (a) the stats are used for final RADIUS
- * accounting, where sub-second accuracy is sufficient; (b) the session is
- * already in the terminating state, so no new traffic is expected.
- */
-static stat_segment_data_t *vpp_stats_dump_res = NULL;
-static struct timespec vpp_stats_dump_res_ts;
-#define VPP_STATS_DUMP_TTL_MS 200
-
-struct vpp_stats_cache_entry {
-	uint64_t rx_packets;
-	uint64_t tx_packets;
-	uint64_t rx_bytes;
-	uint64_t tx_bytes;
+enum {
+	VS_IF_RX,
+	VS_IF_TX,
+	VS_IF_NAMES,
+	VS_N_ENTRIES,
 };
 
-static struct vpp_stats_cache_entry *vpp_stats_cache;
-static size_t vpp_stats_cache_len;
-static int vpp_stats_cache_valid;
+static const char *const vs_entry_name[VS_N_ENTRIES] = {
+	[VS_IF_RX] = "/if/rx",
+	[VS_IF_TX] = "/if/tx",
+	[VS_IF_NAMES] = "/if/names",
+};
 
-/* inotify for detecting VPP restart (socket file deletion) */
-static int vpp_stats_inotify_fd = -1;
-static int vpp_stats_inotify_wd = -1;
-static struct triton_context_t vpp_stats_inotify_ctx;
-static struct triton_md_handler_t vpp_stats_inotify_hnd;
-static struct triton_timer_t vpp_stats_health_timer;
-static char vpp_stats_sock_basename[256] = "stats.sock";  /* fallback */
-#define VPP_STATS_HEALTH_CHECK_INTERVAL 30  /* seconds */
-
-static void vpp_stats_inotify_watch(void);
-static void vpp_stats_health_check(struct triton_timer_t *t);
-static int  vpp_stats_ensure_if_dir(void);
+struct vs_map {
+	const uint8_t *mem;	/* NULL = no mapping */
+	size_t size;
+	uint64_t vbase;		/* address of the segment inside VPP */
+	uint32_t pid;		/* VPP process the segment belongs to */
+	/* directory index of each entry, ~0 = not found yet (atomic) */
+	uint32_t idx[VS_N_ENTRIES];
+	/*
+	 * Monotonic second of a read that failed on a segment that was not
+	 * changing: it is not the layout this file knows (atomic, 0 = none).
+	 * Reads fail at once for VS_UNREADABLE_RETRY_SEC after it, instead
+	 * of walking the whole directory again for every session.
+	 */
+	uint32_t unreadable_at;
+};
 
 /*
- * Connect to VPP statistics segment socket.
- *
- * THREAD-SAFETY NOTE:
- * This function is called under vpp_stats_lock protection (via vpp_stats_connect).
- * We rely on the VPP stat_segment_connect() internal timeout mechanisms instead
- * of using alarm()/signals, which are NOT safe in multi-threaded environments.
- *
- * The previous implementation used alarm() + siglongjmp(), which is dangerous
- * in a multi-threaded daemon because:
- * 1. SIGALRM is delivered to the entire process, not just the calling thread
- * 2. Any thread could intercept the signal, causing undefined behavior
- * 3. siglongjmp can bypass mutex unlocks, causing deadlocks
- *
- * If VPP socket connection hangs, it's better to let the VPP client library
- * handle it (it may have internal timeouts) or rely on system socket timeouts
- * rather than introducing unsafe signal handling.
+ * vs_lock: readers of the mapping hold it for reading, the one that replaces
+ * the mapping for writing. vs_connect_lock: one thread at a time talks to the
+ * stat socket, without vs_lock, so a VPP that does not answer never holds the
+ * readers of a mapping that is still there.
  */
-static int vpp_stats_connect_locked(void)
+static struct vs_map vs;
+static pthread_rwlock_t vs_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_mutex_t vs_connect_lock = PTHREAD_MUTEX_INITIALIZER;
+static time_t vs_next_connect;		/* vs_connect_lock */
+static uint32_t vs_log_at;		/* atomic */
+
+static time_t vs_now(void)
 {
-	if (vpp_stats_connected)
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec;
+}
+
+static long vs_elapsed_ms(const struct timespec *start)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (now.tv_sec - start->tv_sec) * 1000 + (now.tv_nsec - start->tv_nsec) / 1000000;
+}
+
+/* One line per VS_LOG_INTERVAL_SEC for a failure every reader would repeat. */
+static int vs_log_due(void)
+{
+	uint32_t now = (uint32_t)vs_now();
+	uint32_t last = __atomic_load_n(&vs_log_at, __ATOMIC_RELAXED);
+
+	if (last && now - last < VS_LOG_INTERVAL_SEC)
 		return 0;
 
-	/*
-	 * Attempt connection to VPP statistics segment.
-	 * This call should be non-blocking or have reasonable internal timeouts.
-	 * If it blocks indefinitely, that's a VPP API issue that should be
-	 * fixed in libvppapiclient, not worked around with unsafe signals.
-	 */
-	if (stat_segment_connect(STAT_SEGMENT_SOCKET_FILE) != 0) {
-		log_error("vpp_stats: failed to connect to VPP stat segment socket %s\n",
-		          STAT_SEGMENT_SOCKET_FILE);
-		return -1;
+	return __atomic_compare_exchange_n(&vs_log_at, &last, now ? now : 1, 0,
+					   __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+
+/* ---- Bounded access to the segment -------------------------------------- */
+
+/* A value read once: the compiler has no second look at the shared memory. */
+static inline uint64_t vs_ld64(const void *p)
+{
+	uint64_t v;
+
+	__builtin_memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+static inline uint32_t vs_ld32(const void *p)
+{
+	uint32_t v;
+
+	__builtin_memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+/*
+ * Address inside VPP -> address in this mapping, or NULL when [vaddr,
+ * vaddr + need) is not wholly inside the segment, past the shared header.
+ */
+static const uint8_t *vs_ptr(const struct vs_map *m, uint64_t vaddr, size_t need)
+{
+	uint64_t off = vaddr - m->vbase;
+
+	if (off < sizeof(vlib_stats_shared_header_t) || off > m->size || need > m->size - off)
+		return NULL;
+
+	return m->mem + off;
+}
+
+/*
+ * A vppinfra vector of elements of elt bytes at vaddr: its data and its
+ * length, or NULL when the header or the data are not inside the segment.
+ */
+static const uint8_t *vs_vec(const struct vs_map *m, uint64_t vaddr, size_t elt, uint32_t *len)
+{
+	const uint8_t *hdr, *data;
+	uint32_t n;
+
+	if (vaddr < VS_VEC_HDR)
+		return NULL;
+
+	hdr = vs_ptr(m, vaddr - VS_VEC_HDR, VS_VEC_HDR);
+	if (!hdr)
+		return NULL;
+
+	n = vs_ld32(hdr);
+	data = hdr + VS_VEC_HDR;
+	if (n > (m->size - (size_t)(data - m->mem)) / elt)
+		return NULL;
+
+	*len = n;
+	return data;
+}
+
+/*
+ * Start of a read: wait for the VPP writer, for at most what is left of
+ * VS_WRITER_WAIT_MS since *start, and take the epoch. -1 = the writer did
+ * not leave in time.
+ */
+static int vs_read_begin(const struct vs_map *m, const struct timespec *start, uint64_t *epoch)
+{
+	const vlib_stats_shared_header_t *h = (const void *)m->mem;
+	const struct timespec nap = { 0, 100000 };
+	int spin = 0;
+
+	while (__atomic_load_n(&h->in_progress, __ATOMIC_SEQ_CST)) {
+		if (++spin < 200)
+			continue;
+		if (vs_elapsed_ms(start) >= VS_WRITER_WAIT_MS)
+			return -1;
+		nanosleep(&nap, NULL);
 	}
 
-	vpp_stats_connected = 1;
-	log_debug("vpp_stats: connected to VPP stat segment\n");
-	vpp_stats_inotify_watch();
+	*epoch = __atomic_load_n(&h->epoch, __ATOMIC_SEQ_CST);
 	return 0;
 }
 
-static int vpp_stats_connect(void)
-{
-	int ret;
-
-	pthread_mutex_lock(&vpp_stats_lock);
-	ret = vpp_stats_connect_locked();
-	pthread_mutex_unlock(&vpp_stats_lock);
-
-	return ret;
-}
-
 /*
- * Note: We keep the connection open permanently for better performance.
- * This function is kept for compatibility and potential future use.
- */
-static void vpp_stats_disconnect(void)
-{
-	pthread_mutex_lock(&vpp_stats_lock);
-	if (vpp_stats_connected) {
-		stat_segment_disconnect();
-		vpp_stats_connected = 0;
-		log_debug("vpp_stats: disconnected from VPP stat segment\n");
-		pthread_rwlock_wrlock(&vpp_stats_cache_lock);
-		vpp_stats_cache_valid = 0;
-		pthread_rwlock_unlock(&vpp_stats_cache_lock);
-	}
-	/* Invalidate per-session caches — the shared memory mapping is gone */
-	if (vpp_stats_if_dir) {
-		vec_free(vpp_stats_if_dir);
-		vpp_stats_if_dir = NULL;
-	}
-	if (vpp_stats_dump_res) {
-		stat_segment_data_free(vpp_stats_dump_res);
-		vpp_stats_dump_res = NULL;
-	}
-	pthread_mutex_unlock(&vpp_stats_lock);
-}
-
-/*
- * Names of the VPP interfaces by sw_if_index, from /if/names in the stat
- * segment. Unlike sw_interface_dump, the stat segment also names the hidden
- * interfaces (a pppoeN kept for reuse after its session is deleted): the
- * startup reconciliation uses it to tell a hidden pppoeN from an interface
- * of someone else (vppreconcile.c).
+ * End of a read: nothing changed since vs_read_begin().
  *
- * cb runs with vpp_stats_lock held; the name is valid only during the call.
- * Returns 0, or -1 if the stat segment could not be read.
+ * The order of the two loads matters. The writer ends with "epoch++" and
+ * then "in_progress = 0", one right after the other. Looking at the epoch
+ * first (as stat_segment_access_end() of the VPP client does) accepts a read
+ * made in the middle of a write whenever those two stores land between the
+ * two loads: old epoch, flag already clear. Seen about once every two seconds
+ * against a VPP creating interfaces. With in_progress first, a writer that
+ * was active during the read is either still active here, or has already
+ * bumped the epoch that is read next.
  */
-int vpphook_stats_if_names(void (*cb)(uint32_t sw_if_index, const char *name, void *arg), void *arg)
+static int vs_read_ok(const struct vs_map *m, uint64_t epoch)
 {
-	u8 **patterns = 0;
-	u32 *dir;
-	stat_segment_data_t *res;
-	int i, j, ret = -1;
+	const vlib_stats_shared_header_t *h = (const void *)m->mem;
 
-	pthread_mutex_lock(&vpp_stats_lock);
+	if (__atomic_load_n(&h->in_progress, __ATOMIC_SEQ_CST))
+		return 0;
 
-	if (vpp_stats_connect_locked())
-		goto out;
-
-	vec_add1(patterns, (u8 *)"^/if/names$");
-	dir = stat_segment_ls(patterns);
-	vec_free(patterns);
-	if (!dir)
-		goto out;
-
-	res = stat_segment_dump(dir);
-	vec_free(dir);
-	if (!res)
-		goto out;
-
-	for (i = 0; i < vec_len(res); i++) {
-		if (res[i].type != STAT_DIR_TYPE_NAME_VECTOR)
-			continue;
-		for (j = 0; j < vec_len(res[i].name_vector); j++) {
-			if (res[i].name_vector[j])
-				cb(j, (const char *)res[i].name_vector[j], arg);
-		}
-		ret = 0;
-	}
-
-	stat_segment_data_free(res);
-
-out:
-	pthread_mutex_unlock(&vpp_stats_lock);
-	return ret;
+	return __atomic_load_n(&h->epoch, __ATOMIC_SEQ_CST) == epoch;
 }
 
-static int vpp_stats_inotify_read(struct triton_md_handler_t *hnd)
+static const uint8_t *vs_dir(const struct vs_map *m, uint32_t *n)
 {
-	char buf[sizeof(struct inotify_event) + 256];
-	ssize_t n;
-	struct inotify_event *ev;
-	char *p;
+	const vlib_stats_shared_header_t *h = (const void *)m->mem;
+	uint64_t vaddr = (uint64_t)(uintptr_t)__atomic_load_n(&h->directory_vector, __ATOMIC_ACQUIRE);
 
-	n = read(vpp_stats_inotify_fd, buf, sizeof(buf));
-	if (n < (ssize_t)sizeof(struct inotify_event)) {
-		if (n < 0 && errno != EAGAIN)
-			log_warn("vpp_stats: inotify read error: %s\n", strerror(errno));
+	return vs_vec(m, vaddr, sizeof(vlib_stats_entry_t), n);
+}
+
+static int vs_entry_is(const vlib_stats_entry_t *e, const char *name)
+{
+	return e->type != STAT_DIR_TYPE_EMPTY && e->type != STAT_DIR_TYPE_ILLEGAL &&
+	       !strncmp(e->name, name, sizeof(e->name));
+}
+
+/*
+ * Copy of the directory entry "which". The index is kept from one read to
+ * the next (an entry never moves while its VPP runs) and the name is checked
+ * on the copy every time; a walk of the directory happens once per mapping.
+ */
+static int vs_entry(struct vs_map *m, const uint8_t *dir, uint32_t n, int which,
+		    vlib_stats_entry_t *e)
+{
+	const char *name = vs_entry_name[which];
+	uint32_t i = __atomic_load_n(&m->idx[which], __ATOMIC_RELAXED);
+	size_t name_len;
+
+	if (i < n) {
+		memcpy(e, dir + (size_t)i * sizeof(*e), sizeof(*e));
+		if (vs_entry_is(e, name))
+			return 0;
+	}
+
+	/*
+	 * These entries are made when VPP starts, after its error counters:
+	 * a few thousand entries in. Only the name is looked at in place; an
+	 * entry that seems to be the one is copied and checked on the copy.
+	 */
+	name_len = strlen(name) + 1;
+	for (i = 0; i < n; i++) {
+		const uint8_t *d = dir + (size_t)i * sizeof(*e);
+
+		if (memcmp(d + offsetof(vlib_stats_entry_t, name), name, name_len))
+			continue;
+		memcpy(e, d, sizeof(*e));
+		if (!vs_entry_is(e, name))
+			continue;
+		__atomic_store_n(&m->idx[which], i, __ATOMIC_RELAXED);
 		return 0;
 	}
 
-	for (p = buf; p < buf + n; p += sizeof(struct inotify_event) + ev->len) {
-		ev = (struct inotify_event *)p;
-		if (ev->mask & IN_Q_OVERFLOW) {
-			log_warn("vpp_stats: inotify queue overflow, disconnecting (may have missed VPP restart)\n");
-			vpp_stats_disconnect();
+	return -1;
+}
+
+/* The segment is one this file cannot read: do not insist for a while. */
+static int vs_unreadable(const struct vs_map *m)
+{
+	uint32_t at = __atomic_load_n(&m->unreadable_at, __ATOMIC_RELAXED);
+
+	return at && (uint32_t)vs_now() - at < VS_UNREADABLE_RETRY_SEC;
+}
+
+static void vs_set_unreadable(struct vs_map *m)
+{
+	uint32_t now = (uint32_t)vs_now();
+
+	__atomic_store_n(&m->unreadable_at, now ? now : 1, __ATOMIC_RELAXED);
+}
+
+/* Sum over the threads of the combined counter of one interface. */
+static int vs_combined(const struct vs_map *m, const vlib_stats_entry_t *e,
+		       uint32_t sw_if_index, uint64_t *packets, uint64_t *bytes)
+{
+	const uint8_t *threads, *c;
+	uint32_t n_threads, len, t;
+	uint64_t vaddr;
+
+	if (e->type != STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED)
+		return -1;
+
+	threads = vs_vec(m, (uint64_t)(uintptr_t)e->data, sizeof(uint64_t), &n_threads);
+	if (!threads || !n_threads || n_threads > VS_MAX_THREADS)
+		return -1;
+
+	for (t = 0; t < n_threads; t++) {
+		vaddr = vs_ld64(threads + (size_t)t * sizeof(uint64_t));
+		c = vs_vec(m, vaddr, sizeof(vlib_counter_t), &len);
+		if (!c)
+			return -1;
+		/* a thread that never saw the interface has a shorter vector */
+		if (sw_if_index >= len)
+			continue;
+		c += (size_t)sw_if_index * sizeof(vlib_counter_t);
+		*packets += vs_ld64(c + offsetof(vlib_counter_t, packets));
+		*bytes += vs_ld64(c + offsetof(vlib_counter_t, bytes));
+	}
+
+	return 0;
+}
+
+/* vs_lock held for reading. 0 = out[] holds rx packets, rx bytes, tx packets, tx bytes. */
+static int vs_read_if(struct vs_map *m, uint32_t sw_if_index, uint64_t out[4])
+{
+	vlib_stats_entry_t rx, tx;
+	struct timespec start;
+	const uint8_t *dir;
+	uint64_t epoch;
+	uint32_t n;
+	int attempt, stable_fail = 0;
+
+	if (vs_unreadable(m))
+		return -1;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
+	for (attempt = 0; attempt < VS_MAX_ATTEMPTS; attempt++) {
+		/* also bounds the tries of a segment that never stays still */
+		if (vs_read_begin(m, &start, &epoch) ||
+		    (attempt && vs_elapsed_ms(&start) >= VS_WRITER_WAIT_MS))
 			break;
-		}
-		if ((ev->mask & IN_DELETE) && ev->len > 0 &&
-		    strcmp(ev->name, vpp_stats_sock_basename) == 0) {
-			log_debug("vpp_stats: socket removed (VPP restart detected)\n");
-			vpp_stats_disconnect();
-			break;
-		}
-	}
-	return 0;
-}
 
-static void vpp_stats_inotify_watch(void)
-{
-	char path[256];
-	char *last_slash;
-	const char *dir;
-	int wd;
-
-	if (vpp_stats_inotify_fd < 0 || vpp_stats_inotify_wd >= 0)
-		return;
-
-	strncpy(path, STAT_SEGMENT_SOCKET_FILE, sizeof(path) - 1);
-	path[sizeof(path) - 1] = '\0';
-	last_slash = strrchr(path, '/');
-	if (last_slash && last_slash > path) {
-		*last_slash = '\0';
-		dir = path;
-		strncpy(vpp_stats_sock_basename, last_slash + 1, sizeof(vpp_stats_sock_basename) - 1);
-		vpp_stats_sock_basename[sizeof(vpp_stats_sock_basename) - 1] = '\0';
-	} else {
-		dir = ".";
-		strncpy(vpp_stats_sock_basename, path, sizeof(vpp_stats_sock_basename) - 1);
-		vpp_stats_sock_basename[sizeof(vpp_stats_sock_basename) - 1] = '\0';
-	}
-
-	wd = inotify_add_watch(vpp_stats_inotify_fd, dir, IN_DELETE);
-	if (wd >= 0) {
-		vpp_stats_inotify_wd = wd;
-		log_debug("vpp_stats: watching %s for VPP restart\n", path);
-	}
-}
-
-/*
- * Periodic health check: detect VPP crash without clean socket deletion.
- * If VPP dies (SIGKILL, OOM, etc.) the socket file may remain; inotify
- * won't fire IN_DELETE. A lightweight stat_segment_ls verifies connectivity.
- */
-static void vpp_stats_health_check(struct triton_timer_t *t)
-{
-	u8 **patterns = 0;
-	u32 *dir = NULL;
-
-	pthread_mutex_lock(&vpp_stats_lock);
-	if (!vpp_stats_connected) {
-		pthread_mutex_unlock(&vpp_stats_lock);
-		goto reschedule;
-	}
-
-	vec_add1(patterns, (u8 *)"/");
-	dir = stat_segment_ls(patterns);
-	vec_free(patterns);
-	pthread_mutex_unlock(&vpp_stats_lock);
-
-	if (!dir) {
-		log_warn("vpp_stats: health check failed - VPP may have crashed (socket not removed)\n");
-		vpp_stats_disconnect();
-		goto reschedule;
-	}
-	vec_free(dir);
-
-reschedule:
-	vpp_stats_health_timer.expire = vpp_stats_health_check;
-	vpp_stats_health_timer.expire_tv.tv_sec = VPP_STATS_HEALTH_CHECK_INTERVAL;
-	triton_timer_mod(&vpp_stats_health_timer, 0);
-}
-
-static void vpp_stats_inotify_close(struct triton_context_t *ctx)
-{
-	triton_timer_del(&vpp_stats_health_timer);
-	triton_md_disable_handler(&vpp_stats_inotify_hnd, MD_MODE_READ);
-	triton_md_unregister_handler(&vpp_stats_inotify_hnd, 1);
-	if (vpp_stats_inotify_fd >= 0) {
-		close(vpp_stats_inotify_fd);
-		vpp_stats_inotify_fd = -1;
-		vpp_stats_inotify_wd = -1;
-	}
-	triton_context_unregister(ctx);
-}
-
-static void vpp_stats_sum_simple(const stat_segment_data_t *data,
-				 uint32_t sw_if_index,
-				 uint64_t *value)
-{
-	u32 thread;
-
-	if (!data || data->type != STAT_DIR_TYPE_COUNTER_VECTOR_SIMPLE)
-		return;
-
-	for (thread = 0; thread < vec_len(data->simple_counter_vec); thread++) {
-		if (sw_if_index >= vec_len(data->simple_counter_vec[thread]))
-			continue;
-		*value += data->simple_counter_vec[thread][sw_if_index];
-	}
-}
-
-static void vpp_stats_sum_combined(const stat_segment_data_t *data,
-				   uint32_t sw_if_index,
-				   uint64_t *packets,
-				   uint64_t *bytes)
-{
-	u32 thread;
-
-	if (!data || data->type != STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED)
-		return;
-
-	for (thread = 0; thread < vec_len(data->combined_counter_vec); thread++) {
-		if (sw_if_index >= vec_len(data->combined_counter_vec[thread]))
-			continue;
-		*packets += data->combined_counter_vec[thread][sw_if_index].packets;
-		*bytes += data->combined_counter_vec[thread][sw_if_index].bytes;
-	}
-}
-
-static size_t vpp_stats_max_index_simple(const stat_segment_data_t *data)
-{
-	u32 thread;
-	size_t max_len = 0;
-
-	if (!data || data->type != STAT_DIR_TYPE_COUNTER_VECTOR_SIMPLE)
-		return 0;
-
-	for (thread = 0; thread < vec_len(data->simple_counter_vec); thread++) {
-		if (vec_len(data->simple_counter_vec[thread]) > max_len)
-			max_len = vec_len(data->simple_counter_vec[thread]);
-	}
-
-	return max_len;
-}
-
-static size_t vpp_stats_max_index_combined(const stat_segment_data_t *data)
-{
-	u32 thread;
-	size_t max_len = 0;
-
-	if (!data || data->type != STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED)
-		return 0;
-
-	for (thread = 0; thread < vec_len(data->combined_counter_vec); thread++) {
-		if (vec_len(data->combined_counter_vec[thread]) > max_len)
-			max_len = vec_len(data->combined_counter_vec[thread]);
-	}
-
-	return max_len;
-}
-
-/*
- * Refresh the global statistics cache by querying VPP for all interface counters.
- * This function is called at the start of batch statistics collection.
- *
- * LOCKING STRATEGY:
- * - Acquires vpp_stats_cache_lock (read) to copy filter configuration
- * - Releases lock during VPP API calls (which may take 10-100ms)
- * - Acquires vpp_stats_cache_lock (write) to update the global cache
- *
- * ERROR HANDLING:
- * The filter_locked variable tracks whether we're holding the read lock,
- * ensuring it's always released before returning on error paths.
- *
- * MEMORY ALLOCATION:
- * Allocates a new cache array based on the highest sw_if_index seen.
- * The old cache is freed only after the new one is successfully populated.
- */
-static int vpp_stats_cache_refresh(void)
-{
-	u32 *dir = NULL;
-	stat_segment_data_t *res = NULL;
-	struct vpp_stats_cache_entry *cache = NULL;
-	size_t cache_len = 0;
-	uint32_t *filter = NULL;
-	size_t filter_len = 0;
-	int filter_locked = 0;
-	int have_rx_packets = 0;
-	int have_tx_packets = 0;
-	int have_rx_bytes = 0;
-	int have_tx_bytes = 0;
-	u32 i;
-	struct timespec ts_start, ts_end;
-	long long elapsed_ms;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts_start);
-
-	/*
-	 * Hold vpp_stats_lock for the entire duration of stat_segment_* usage.
-	 * Prevents SIGSEGV: inotify/health_check can call stat_segment_disconnect()
-	 * (munmap) while we iterate over res[]. Without this lock, we'd read
-	 * unmapped memory and crash.
-	 */
-	pthread_mutex_lock(&vpp_stats_lock);
-	if (!vpp_stats_connected) {
-		pthread_mutex_unlock(&vpp_stats_lock);
-		return -1;
-	}
-
-	/*
-	 * Reuse the cached interface directory to avoid another stat_segment_ls()
-	 * regex scan. If not yet cached, populate it now (once per connection).
-	 */
-	if (vpp_stats_ensure_if_dir()) {
-		pthread_mutex_unlock(&vpp_stats_lock);
-		log_error("vpp_stats: stat_segment_ls failed - VPP may be down or restarting\n");
-		vpp_stats_disconnect();
-		return -1;
-	}
-	dir = vpp_stats_if_dir;
-
-	/*
-	 * For the batch refresh we always want a fresh dump — do not use the
-	 * short-lived per-session dump cache here, since batch mode collects stats
-	 * for ALL sessions and accuracy matters more than latency savings.
-	 */
-	res = stat_segment_dump(dir);
-	if (!res) {
-		/* dir may be stale; invalidate so next call re-runs stat_segment_ls */
-		vec_free(vpp_stats_if_dir);
-		vpp_stats_if_dir = NULL;
-		pthread_mutex_unlock(&vpp_stats_lock);
-		log_error("vpp_stats: stat_segment_dump failed - VPP may be down or restarting\n");
-		vpp_stats_disconnect();
-		return -1;
-	}
-
-	/*
-	 * Acquire read lock to safely copy the filter configuration.
-	 * We release immediately if no filter is set, or keep it locked
-	 * if we need to use the filter during cache population.
-	 */
-	pthread_rwlock_rdlock(&vpp_stats_cache_lock);
-	filter = vpp_stats_filter;
-	filter_len = vpp_stats_filter_len;
-	if (!filter_len) {
-		pthread_rwlock_unlock(&vpp_stats_cache_lock);
-		filter_locked = 0;
-	} else {
-		filter_locked = 1;
-	}
-
-	for (i = 0; i < vec_len(res); i++) {
-		size_t max_len = 0;
-
-		if (!res[i].name)
-			continue;
-
-		if (!strcmp(res[i].name, "/if/rx") || !strcmp(res[i].name, "/if/tx")) {
-			max_len = vpp_stats_max_index_combined(&res[i]);
-			if (!max_len)
-				max_len = vpp_stats_max_index_simple(&res[i]);
-		} else if (!strcmp(res[i].name, "/if/rx-bytes") || !strcmp(res[i].name, "/if/tx-bytes")) {
-			max_len = vpp_stats_max_index_simple(&res[i]);
-		}
-
-		if (max_len > cache_len)
-			cache_len = max_len;
-	}
-
-	if (!cache_len) {
-		if (filter_locked)
-			pthread_rwlock_unlock(&vpp_stats_cache_lock);
-		stat_segment_data_free(res);
-		pthread_mutex_unlock(&vpp_stats_lock);
-		return -1;
-	}
-
-	if (filter_len) {
-		size_t idx;
-		cache_len = 0;
-		for (idx = 0; idx < filter_len; idx++) {
-			if (filter[idx] + 1 > cache_len)
-				cache_len = filter[idx] + 1;
-		}
-	}
-
-	/*
-	 * SANITY CHECK: Prevent excessive memory allocation for sparse interface indices.
-	 * If VPP generates very high sw_if_index values (e.g., due to not recycling IDs
-	 * after many interface create/delete cycles), we could attempt to allocate
-	 * hundreds of megabytes of memory for mostly empty cache entries.
-	 *
-	 * Typical deployments use sequential indices (0, 1, 2, ..., N) where N < 100K.
-	 * If we encounter indices beyond this threshold, log a warning and fall back
-	 * to non-batch mode for safety.
-	 */
-	if (cache_len > MAX_SANE_SW_IF_INDEX) {
-		log_warn("vpp_stats: refusing to allocate cache for %zu interfaces "
-		         "(max_index=%zu, threshold=%d). VPP may not be recycling interface IDs. "
-		         "Falling back to non-batch stats collection.\n",
-		         cache_len, cache_len - 1, MAX_SANE_SW_IF_INDEX);
-		if (filter_locked)
-			pthread_rwlock_unlock(&vpp_stats_cache_lock);
-		stat_segment_data_free(res);
-		pthread_mutex_unlock(&vpp_stats_lock);
-		return -1;
-	}
-
-	cache = _malloc(cache_len * sizeof(*cache));
-	if (!cache) {
-		if (filter_locked)
-			pthread_rwlock_unlock(&vpp_stats_cache_lock);
-		stat_segment_data_free(res);
-		pthread_mutex_unlock(&vpp_stats_lock);
-		return -1;
-	}
-	memset(cache, 0, cache_len * sizeof(*cache));
-
-	for (i = 0; i < vec_len(res); i++) {
-		if (!res[i].name)
-			continue;
-
-		if (!strcmp(res[i].name, "/if/rx")) {
-			if (filter_len) {
-				size_t idx;
-				have_rx_packets = 1;
-				if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED)
-					have_rx_bytes = 1;
-				for (idx = 0; idx < filter_len; idx++) {
-					u32 thread;
-					u32 sw_if_index = filter[idx];
-					if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED) {
-						for (thread = 0; thread < vec_len(res[i].combined_counter_vec); thread++) {
-							if (sw_if_index >= vec_len(res[i].combined_counter_vec[thread]))
-								continue;
-							cache[sw_if_index].rx_packets += res[i].combined_counter_vec[thread][sw_if_index].packets;
-							cache[sw_if_index].rx_bytes += res[i].combined_counter_vec[thread][sw_if_index].bytes;
-						}
-					} else if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_SIMPLE) {
-						for (thread = 0; thread < vec_len(res[i].simple_counter_vec); thread++) {
-							if (sw_if_index >= vec_len(res[i].simple_counter_vec[thread]))
-								continue;
-							cache[sw_if_index].rx_packets += res[i].simple_counter_vec[thread][sw_if_index];
-						}
-					}
-				}
-			} else if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED) {
-				u32 thread;
-				have_rx_packets = 1;
-				have_rx_bytes = 1;
-				for (thread = 0; thread < vec_len(res[i].combined_counter_vec); thread++) {
-					u32 j;
-					for (j = 0; j < vec_len(res[i].combined_counter_vec[thread]); j++) {
-						cache[j].rx_packets += res[i].combined_counter_vec[thread][j].packets;
-						cache[j].rx_bytes += res[i].combined_counter_vec[thread][j].bytes;
-					}
-				}
-			} else if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_SIMPLE) {
-				u32 thread;
-				have_rx_packets = 1;
-				for (thread = 0; thread < vec_len(res[i].simple_counter_vec); thread++) {
-					u32 j;
-					for (j = 0; j < vec_len(res[i].simple_counter_vec[thread]); j++)
-						cache[j].rx_packets += res[i].simple_counter_vec[thread][j];
-				}
-			}
-			continue;
-		}
-
-		if (!strcmp(res[i].name, "/if/tx")) {
-			if (filter_len) {
-				size_t idx;
-				have_tx_packets = 1;
-				if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED)
-					have_tx_bytes = 1;
-				for (idx = 0; idx < filter_len; idx++) {
-					u32 thread;
-					u32 sw_if_index = filter[idx];
-					if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED) {
-						for (thread = 0; thread < vec_len(res[i].combined_counter_vec); thread++) {
-							if (sw_if_index >= vec_len(res[i].combined_counter_vec[thread]))
-								continue;
-							cache[sw_if_index].tx_packets += res[i].combined_counter_vec[thread][sw_if_index].packets;
-							cache[sw_if_index].tx_bytes += res[i].combined_counter_vec[thread][sw_if_index].bytes;
-						}
-					} else if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_SIMPLE) {
-						for (thread = 0; thread < vec_len(res[i].simple_counter_vec); thread++) {
-							if (sw_if_index >= vec_len(res[i].simple_counter_vec[thread]))
-								continue;
-							cache[sw_if_index].tx_packets += res[i].simple_counter_vec[thread][sw_if_index];
-						}
-					}
-				}
-			} else if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED) {
-				u32 thread;
-				have_tx_packets = 1;
-				have_tx_bytes = 1;
-				for (thread = 0; thread < vec_len(res[i].combined_counter_vec); thread++) {
-					u32 j;
-					for (j = 0; j < vec_len(res[i].combined_counter_vec[thread]); j++) {
-						cache[j].tx_packets += res[i].combined_counter_vec[thread][j].packets;
-						cache[j].tx_bytes += res[i].combined_counter_vec[thread][j].bytes;
-					}
-				}
-			} else if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_SIMPLE) {
-				u32 thread;
-				have_tx_packets = 1;
-				for (thread = 0; thread < vec_len(res[i].simple_counter_vec); thread++) {
-					u32 j;
-					for (j = 0; j < vec_len(res[i].simple_counter_vec[thread]); j++)
-						cache[j].tx_packets += res[i].simple_counter_vec[thread][j];
-				}
-			}
-			continue;
-		}
-
-		if (!strcmp(res[i].name, "/if/rx-bytes")) {
-			u32 thread;
-			have_rx_bytes = 1;
-			if (filter_len) {
-				size_t idx;
-				for (idx = 0; idx < filter_len; idx++) {
-					u32 sw_if_index = filter[idx];
-					for (thread = 0; thread < vec_len(res[i].simple_counter_vec); thread++) {
-						if (sw_if_index >= vec_len(res[i].simple_counter_vec[thread]))
-							continue;
-						cache[sw_if_index].rx_bytes += res[i].simple_counter_vec[thread][sw_if_index];
-					}
-				}
-			} else {
-				for (thread = 0; thread < vec_len(res[i].simple_counter_vec); thread++) {
-					u32 j;
-					for (j = 0; j < vec_len(res[i].simple_counter_vec[thread]); j++)
-						cache[j].rx_bytes += res[i].simple_counter_vec[thread][j];
-				}
-			}
-			continue;
-		}
-
-		if (!strcmp(res[i].name, "/if/tx-bytes")) {
-			u32 thread;
-			have_tx_bytes = 1;
-			if (filter_len) {
-				size_t idx;
-				for (idx = 0; idx < filter_len; idx++) {
-					u32 sw_if_index = filter[idx];
-					for (thread = 0; thread < vec_len(res[i].simple_counter_vec); thread++) {
-						if (sw_if_index >= vec_len(res[i].simple_counter_vec[thread]))
-							continue;
-						cache[sw_if_index].tx_bytes += res[i].simple_counter_vec[thread][sw_if_index];
-					}
-				}
-			} else {
-				for (thread = 0; thread < vec_len(res[i].simple_counter_vec); thread++) {
-					u32 j;
-					for (j = 0; j < vec_len(res[i].simple_counter_vec[thread]); j++)
-						cache[j].tx_bytes += res[i].simple_counter_vec[thread][j];
-				}
-			}
-			continue;
-		}
-	}
-
-	/*
-	 * Release filter lock if we were holding it.
-	 * We're done reading filter values during cache population.
-	 */
-	if (filter_locked) {
-		pthread_rwlock_unlock(&vpp_stats_cache_lock);
-		filter_locked = 0;
-	}
-
-	stat_segment_data_free(res);
-	pthread_mutex_unlock(&vpp_stats_lock);
-
-	/*
-	 * Verify we got all required counter types from VPP.
-	 * If any are missing, VPP may be in an inconsistent state.
-	 */
-	if (!have_rx_packets || !have_tx_packets || !have_rx_bytes || !have_tx_bytes) {
-		log_error("vpp_stats: incomplete statistics from VPP (rx_pkt=%d tx_pkt=%d rx_bytes=%d tx_bytes=%d)\n",
-		          have_rx_packets, have_tx_packets, have_rx_bytes, have_tx_bytes);
-		_free(cache);
-		return -1;
-	}
-
-	/*
-	 * Atomically swap the old cache with the new one.
-	 * This ensures readers using vpp_stats_cache_get() always see
-	 * either fully valid old data or fully valid new data.
-	 */
-	pthread_rwlock_wrlock(&vpp_stats_cache_lock);
-	if (vpp_stats_cache)
-		_free(vpp_stats_cache);
-	vpp_stats_cache = cache;
-	vpp_stats_cache_len = cache_len;
-	vpp_stats_cache_valid = 1;
-	pthread_rwlock_unlock(&vpp_stats_cache_lock);
-
-	clock_gettime(CLOCK_MONOTONIC, &ts_end);
-	elapsed_ms = (ts_end.tv_sec - ts_start.tv_sec) * 1000LL;
-	elapsed_ms += (ts_end.tv_nsec - ts_start.tv_nsec) / 1000000LL;
-
-	log_debug("vpp_stats: cache refresh completed in %lld ms (cache_len=%zu, filter_len=%zu)\n",
-	          elapsed_ms, cache_len, filter_len);
-
-	return 0;
-}
-
-static int vpp_stats_cache_get(uint32_t sw_if_index, struct rtnl_link_stats64 *stats)
-{
-	int ret = -1;
-
-	pthread_rwlock_rdlock(&vpp_stats_cache_lock);
-	if (vpp_stats_cache_valid && sw_if_index < vpp_stats_cache_len) {
-		memset(stats, 0, sizeof(*stats));
-		stats->rx_packets = vpp_stats_cache[sw_if_index].rx_packets;
-		stats->tx_packets = vpp_stats_cache[sw_if_index].tx_packets;
-		stats->rx_bytes = vpp_stats_cache[sw_if_index].rx_bytes;
-		stats->tx_bytes = vpp_stats_cache[sw_if_index].tx_bytes;
-		ret = 0;
-	}
-	pthread_rwlock_unlock(&vpp_stats_cache_lock);
-
-	return ret;
-}
-
-/*
- * Populate vpp_stats_if_dir if not already cached.
- * Must be called under vpp_stats_lock.
- * Returns 0 on success, -1 on failure.
- */
-static int vpp_stats_ensure_if_dir(void)
-{
-	u8 **patterns = 0;
-	u32 *dir;
-
-	if (vpp_stats_if_dir)
-		return 0;
-
-	vec_add1(patterns, (u8 *)"/if/rx");
-	vec_add1(patterns, (u8 *)"/if/tx");
-	vec_add1(patterns, (u8 *)"/if/rx-bytes");
-	vec_add1(patterns, (u8 *)"/if/tx-bytes");
-	dir = stat_segment_ls(patterns);
-	vec_free(patterns);
-
-	if (!dir)
-		return -1;
-
-	vpp_stats_if_dir = dir;
-	return 0;
-}
-
-static int vpp_stats_read_interface(uint32_t sw_if_index, struct rtnl_link_stats64 *stats)
-{
-	stat_segment_data_t *res = NULL;
-	uint64_t rx_packets = 0;
-	uint64_t tx_packets = 0;
-	uint64_t rx_bytes = 0;
-	uint64_t tx_bytes = 0;
-	int have_rx_packets = 0;
-	int have_tx_packets = 0;
-	int have_rx_bytes = 0;
-	int have_tx_bytes = 0;
-	u32 i;
-
-	pthread_mutex_lock(&vpp_stats_lock);
-	if (!vpp_stats_connected) {
-		pthread_mutex_unlock(&vpp_stats_lock);
-		return -1;
-	}
-
-	/*
-	 * Get cached directory (avoids per-session regex via stat_segment_ls_r).
-	 * vpp_stats_if_dir is populated once per VPP connection and reused for
-	 * every subsequent call, eliminating the dominant regexec overhead.
-	 */
-	if (vpp_stats_ensure_if_dir()) {
-		pthread_mutex_unlock(&vpp_stats_lock);
-		vpp_stats_disconnect();
-		return -1;
-	}
-
-	/*
-	 * Reuse a recent dump if it's within the TTL window.
-	 * During mass disconnect all sessions terminate within milliseconds of
-	 * each other; sharing one dump result reduces N×dump() to ~1 call and
-	 * eliminates the VPP worker-thread synchronization bottleneck.
-	 */
-	if (vpp_stats_dump_res) {
-		struct timespec now;
-		long long age_ms;
-
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		age_ms = (now.tv_sec - vpp_stats_dump_res_ts.tv_sec) * 1000LL +
-		         (now.tv_nsec - vpp_stats_dump_res_ts.tv_nsec) / 1000000LL;
-		if (age_ms >= VPP_STATS_DUMP_TTL_MS) {
-			stat_segment_data_free(vpp_stats_dump_res);
-			vpp_stats_dump_res = NULL;
-		}
-	}
-
-	if (!vpp_stats_dump_res) {
-		vpp_stats_dump_res = stat_segment_dump(vpp_stats_if_dir);
-		if (!vpp_stats_dump_res) {
-			/*
-			 * Dump failed; the cached dir may be stale (e.g. VPP
-			 * restarted without a clean socket deletion). Invalidate
-			 * the dir so the next call rebuilds it via stat_segment_ls.
-			 */
-			vec_free(vpp_stats_if_dir);
-			vpp_stats_if_dir = NULL;
-			pthread_mutex_unlock(&vpp_stats_lock);
-			vpp_stats_disconnect();
+		memset(out, 0, 4 * sizeof(out[0]));
+
+		dir = vs_dir(m, &n);
+		if (dir &&
+		    !vs_entry(m, dir, n, VS_IF_RX, &rx) &&
+		    !vs_entry(m, dir, n, VS_IF_TX, &tx) &&
+		    !vs_combined(m, &rx, sw_if_index, &out[0], &out[1]) &&
+		    !vs_combined(m, &tx, sw_if_index, &out[2], &out[3]) &&
+		    vs_read_ok(m, epoch))
+			return 0;
+
+		/*
+		 * The segment did not change and still could not be read,
+		 * three times in a row: it is not the layout this file knows,
+		 * and one more try reads the same thing.
+		 */
+		if (!vs_read_ok(m, epoch)) {
+			stable_fail = 0;
+		} else if (++stable_fail >= VS_STABLE_FAILS) {
+			vs_set_unreadable(m);
+			if (vs_log_due())
+				log_error("vpp_stats: interface counters not found in the VPP stat segment\n");
 			return -1;
 		}
-		clock_gettime(CLOCK_MONOTONIC, &vpp_stats_dump_res_ts);
-	}
-	res = vpp_stats_dump_res;
-
-	for (i = 0; i < vec_len(res); i++) {
-		if (!res[i].name)
-			continue;
-
-		if (!strcmp(res[i].name, "/if/rx")) {
-			if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED) {
-				vpp_stats_sum_combined(&res[i], sw_if_index, &rx_packets, &rx_bytes);
-				have_rx_packets = 1;
-				have_rx_bytes = 1;
-			} else if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_SIMPLE) {
-				vpp_stats_sum_simple(&res[i], sw_if_index, &rx_packets);
-				have_rx_packets = 1;
-			}
-			continue;
-		}
-
-		if (!strcmp(res[i].name, "/if/tx")) {
-			if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_COMBINED) {
-				vpp_stats_sum_combined(&res[i], sw_if_index, &tx_packets, &tx_bytes);
-				have_tx_packets = 1;
-				have_tx_bytes = 1;
-			} else if (res[i].type == STAT_DIR_TYPE_COUNTER_VECTOR_SIMPLE) {
-				vpp_stats_sum_simple(&res[i], sw_if_index, &tx_packets);
-				have_tx_packets = 1;
-			}
-			continue;
-		}
-
-		if (!strcmp(res[i].name, "/if/rx-bytes")) {
-			vpp_stats_sum_simple(&res[i], sw_if_index, &rx_bytes);
-			have_rx_bytes = 1;
-			continue;
-		}
-
-		if (!strcmp(res[i].name, "/if/tx-bytes")) {
-			vpp_stats_sum_simple(&res[i], sw_if_index, &tx_bytes);
-			have_tx_bytes = 1;
-			continue;
-		}
 	}
 
-	/* Do NOT free res here — it is owned by vpp_stats_dump_res cache */
-	pthread_mutex_unlock(&vpp_stats_lock);
+	if (vs_log_due())
+		log_warn("vpp_stats: VPP kept changing the stat segment for %ld ms, read given up\n",
+			 vs_elapsed_ms(&start));
 
-	if (!have_rx_packets || !have_tx_packets || !have_rx_bytes || !have_tx_bytes)
+	return -1;
+}
+
+/* ---- Mapping ------------------------------------------------------------ */
+
+static int vs_recv_fd(int sock)
+{
+	struct msghdr msg;
+	char iobuf[1];
+	struct iovec io = { .iov_base = iobuf, .iov_len = sizeof(iobuf) };
+	union {
+		char buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} u;
+	struct cmsghdr *cmsg;
+	int fd = -1;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_iov = &io;
+	msg.msg_iovlen = 1;
+	msg.msg_control = u.buf;
+	msg.msg_controllen = sizeof(u.buf);
+
+	if (recvmsg(sock, &msg, MSG_CMSG_CLOEXEC) < 0)
+		return -1;
+
+	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+		if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+		    cmsg->cmsg_len >= CMSG_LEN(sizeof(int)))
+			memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
+	}
+
+	return fd;
+}
+
+/*
+ * Ask VPP for the segment and map it. No lock of this file is needed: m is
+ * private to the caller until it installs it.
+ */
+static int vs_open(struct vs_map *m)
+{
+	const struct timeval tv = {
+		.tv_sec = VS_SOCKET_TIMEOUT_MS / 1000,
+		.tv_usec = (VS_SOCKET_TIMEOUT_MS % 1000) * 1000,
+	};
+	const vlib_stats_shared_header_t *h;
+	struct sockaddr_un un;
+	struct ucred cred;
+	socklen_t len;
+	struct stat st;
+	void *mem;
+	int sock, fd, i;
+
+	memset(m, 0, sizeof(*m));
+
+	sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+	if (sock < 0)
+		return -1;
+
+	/* connect() waits on the send timeout when the listen queue is full */
+	setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	memset(&un, 0, sizeof(un));
+	un.sun_family = AF_UNIX;
+	strncpy(un.sun_path, VS_SOCKET_FILE, sizeof(un.sun_path) - 1);
+	if (connect(sock, (struct sockaddr *)&un, sizeof(un)) < 0) {
+		close(sock);
+		return -1;
+	}
+
+	len = sizeof(cred);
+	if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 && cred.pid > 0)
+		m->pid = cred.pid;
+
+	fd = vs_recv_fd(sock);
+	close(sock);
+	if (fd < 0)
+		return -1;
+
+	if (fstat(fd, &st) < 0 || st.st_size < (off_t)(sizeof(*h) + VS_VEC_HDR)) {
+		close(fd);
+		return -1;
+	}
+
+	mem = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	close(fd);
+	if (mem == MAP_FAILED)
+		return -1;
+
+	h = mem;
+	if (h->version != VS_SEGMENT_VERSION || !h->base) {
+		if (vs_log_due())
+			log_error("vpp_stats: VPP stat segment version %llu is not the one this module reads (%d)\n",
+				  (unsigned long long)h->version, VS_SEGMENT_VERSION);
+		munmap(mem, st.st_size);
+		return -1;
+	}
+
+	m->mem = mem;
+	m->size = st.st_size;
+	m->vbase = (uint64_t)(uintptr_t)h->base;
+	for (i = 0; i < VS_N_ENTRIES; i++)
+		m->idx[i] = ~0U;
+
+	return 0;
+}
+
+/*
+ * Replace the mapping by the segment of the VPP that answers on the stat
+ * socket now. Returns 0 when a mapping of the VPP process "pid" is in place.
+ */
+static int vs_remap(uint32_t pid)
+{
+	struct vs_map nm, old;
+	time_t now;
+
+	if (pthread_mutex_trylock(&vs_connect_lock))
+		return -1;
+
+	now = vs_now();
+	if (now < vs_next_connect)
+		goto fail;
+	vs_next_connect = now + VS_CONNECT_RETRY_SEC;
+
+	if (vs_open(&nm))
+		goto fail;
+
+	if (!nm.pid) {
+		/* no SO_PEERCRED: the socket is taken on trust */
+		nm.pid = pid;
+	} else if (nm.pid != pid) {
+		/*
+		 * The stat socket is of another VPP process than the one the
+		 * API talks to: VPP restarted and the API has not caught up,
+		 * or the caller asks for a VPP that is gone. Not this one.
+		 * (A VPP in another pid namespace would always end here: its
+		 * counters are not read.)
+		 */
+		if (vs_log_due())
+			log_warn("vpp_stats: the stat socket belongs to VPP pid %u, the counters asked for are of pid %u\n",
+				 nm.pid, pid);
+		munmap((void *)nm.mem, nm.size);
+		goto fail;
+	}
+
+	pthread_rwlock_wrlock(&vs_lock);
+	old = vs;
+	vs = nm;
+	pthread_rwlock_unlock(&vs_lock);
+
+	if (old.mem)
+		munmap((void *)old.mem, old.size);
+
+	log_debug("vpp_stats: mapped the stat segment of VPP pid %u (%zu MB)\n", nm.pid, nm.size >> 20);
+
+	pthread_mutex_unlock(&vs_connect_lock);
+	return 0;
+
+fail:
+	pthread_mutex_unlock(&vs_connect_lock);
+	return -1;
+}
+
+/*
+ * Run fn on the mapping of the VPP process pid, with vs_lock held for
+ * reading. The mapping is replaced when it is of another process, but only
+ * on behalf of the VPP the API is connected to now: a caller that asks for a
+ * VPP that is gone never takes the mapping away from the others.
+ */
+static int vs_with_map(uint32_t pid, int (*fn)(struct vs_map *m, void *arg), void *arg)
+{
+	int tries, r;
+
+	if (!pid)
+		return -1;
+
+	for (tries = 0; tries < 2; tries++) {
+		pthread_rwlock_rdlock(&vs_lock);
+		if (vs.mem && vs.pid == pid) {
+			r = fn(&vs, arg);
+			pthread_rwlock_unlock(&vs_lock);
+			return r;
+		}
+		pthread_rwlock_unlock(&vs_lock);
+
+		if (pid != vpp_instance_pid() || vs_remap(pid))
+			return -1;
+	}
+
+	return -1;
+}
+
+void vpp_stats_drop(void)
+{
+	struct vs_map old;
+
+	pthread_rwlock_wrlock(&vs_lock);
+	old = vs;
+	memset(&vs, 0, sizeof(vs));
+	pthread_rwlock_unlock(&vs_lock);
+
+	if (old.mem) {
+		munmap((void *)old.mem, old.size);
+		log_debug("vpp_stats: dropped the stat segment of VPP pid %u\n", old.pid);
+	}
+}
+
+/* ---- Interface counters -------------------------------------------------- */
+
+struct vs_if_arg {
+	uint32_t sw_if_index;
+	uint64_t out[4];
+};
+
+static int vs_if_fn(struct vs_map *m, void *arg)
+{
+	struct vs_if_arg *a = arg;
+
+	return vs_read_if(m, a->sw_if_index, a->out);
+}
+
+int vpp_stats_read_if(uint32_t vpp_pid, uint32_t sw_if_index, struct rtnl_link_stats64 *stats)
+{
+	struct vs_if_arg a = { .sw_if_index = sw_if_index };
+
+	if (sw_if_index == ~0U || vs_with_map(vpp_pid, vs_if_fn, &a))
 		return -1;
 
 	memset(stats, 0, sizeof(*stats));
-	stats->rx_packets = rx_packets;
-	stats->tx_packets = tx_packets;
-	stats->rx_bytes = rx_bytes;
-	stats->tx_bytes = tx_bytes;
+	stats->rx_packets = a.out[0];
+	stats->rx_bytes = a.out[1];
+	stats->tx_packets = a.out[2];
+	stats->tx_bytes = a.out[3];
 
 	return 0;
 }
@@ -922,7 +667,6 @@ static int vpp_stats_read_interface(uint32_t sw_if_index, struct rtnl_link_stats
 int vpphook_read_stats(struct ap_session *ses, struct rtnl_link_stats64 *stats)
 {
 	struct vpphook_private_data_t *pd;
-	int batch_active;
 
 	if (!ses || !stats)
 		return -1;
@@ -931,142 +675,108 @@ int vpphook_read_stats(struct ap_session *ses, struct rtnl_link_stats64 *stats)
 	if (!pd)
 		return -1;
 
-	/* Check if batch mode is active (thread-safe read) */
-	pthread_rwlock_rdlock(&vpp_stats_cache_lock);
-	batch_active = vpp_stats_batch_active;
-	pthread_rwlock_unlock(&vpp_stats_cache_lock);
-
-	if (batch_active) {
-		if (!vpp_stats_cache_get(pd->vpp_sw_if_index, stats))
-			return 0;
-		/* Session's sw_if_index outside cache (e.g. new clients after batch start).
-		 * Return zeros instead of blocking with per-session IPC - avoids holding
-		 * ses_lock for seconds during "show sessions" and freezing the BNG. */
-		memset(stats, 0, sizeof(*stats));
-		return 0;
-	}
-
 	/*
-	 * Connect once and keep the connection open for all subsequent queries.
-	 * This eliminates reconnection overhead when querying stats for multiple
-	 * sessions. The connection is maintained indefinitely since stats queries
-	 * are frequent (CLI commands, radius accounting, etc).
-	 *
-	 * Performance impact:
-	 * - Before: 30 sessions × (connect + dump + disconnect) = ~5-15 seconds
-	 * - After:  1 connect + 30 dumps = ~50-200ms
+	 * The counters of the VPP process that made the interface, whatever
+	 * VPP runs now: after a VPP restart the session reads the last values
+	 * of the old segment while it is still mapped, and nothing after.
 	 */
-	if (vpp_stats_connect())
-		return -1;
-
-	return vpp_stats_read_interface(pd->vpp_sw_if_index, stats);
+	return vpp_stats_read_if(__atomic_load_n(&pd->vpp_pid, __ATOMIC_RELAXED),
+				 __atomic_load_n(&pd->vpp_sw_if_index, __ATOMIC_RELAXED), stats);
 }
 
-int vpphook_stats_batch_set_filter(const uint32_t *if_indices, size_t count)
-{
-	uint32_t *copy = NULL;
+/* ---- Interface names ----------------------------------------------------- */
 
-	if (count) {
-		copy = _malloc(count * sizeof(*copy));
-		if (!copy)
+struct vs_names_arg {
+	char (*names)[VS_IF_NAME_LEN];
+	uint32_t n;
+};
+
+/* vs_lock held for reading. Fills a->names with a copy of /if/names. */
+static int vs_names_fn(struct vs_map *m, void *arg)
+{
+	struct vs_names_arg *a = arg;
+	vlib_stats_entry_t e;
+	struct timespec start;
+	const uint8_t *dir, *vec, *s;
+	uint64_t epoch;
+	uint32_t n, n_if, len, i;
+	int attempt, stable_fail = 0;
+
+	if (vs_unreadable(m))
+		return -1;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
+	for (attempt = 0; attempt < VS_MAX_ATTEMPTS; attempt++) {
+		if (vs_read_begin(m, &start, &epoch) ||
+		    (attempt && vs_elapsed_ms(&start) >= VS_WRITER_WAIT_MS))
+			break;
+
+		free(a->names);
+		a->names = NULL;
+		a->n = 0;
+
+		dir = vs_dir(m, &n);
+		if (!dir || vs_entry(m, dir, n, VS_IF_NAMES, &e) ||
+		    e.type != STAT_DIR_TYPE_NAME_VECTOR)
+			goto again;
+
+		vec = vs_vec(m, (uint64_t)(uintptr_t)e.data, sizeof(uint64_t), &n_if);
+		if (!vec || n_if > VS_MAX_INTERFACES)
+			goto again;
+
+		a->names = calloc(n_if ? n_if : 1, sizeof(*a->names));
+		if (!a->names)
 			return -1;
-		memcpy(copy, if_indices, count * sizeof(*copy));
+
+		for (i = 0; i < n_if; i++) {
+			uint64_t vaddr = vs_ld64(vec + (size_t)i * sizeof(uint64_t));
+
+			/* no name: the index was never used, or the name was freed */
+			if (!vaddr)
+				continue;
+			s = vs_vec(m, vaddr, 1, &len);
+			if (!s)
+				goto again;
+			if (len > VS_IF_NAME_LEN - 1)
+				len = VS_IF_NAME_LEN - 1;
+			memcpy(a->names[i], s, len);
+			a->names[i][len] = 0;
+		}
+
+		if (vs_read_ok(m, epoch)) {
+			a->n = n_if;
+			return 0;
+		}
+		continue;
+again:
+		if (!vs_read_ok(m, epoch)) {
+			stable_fail = 0;
+		} else if (++stable_fail >= VS_STABLE_FAILS) {
+			vs_set_unreadable(m);
+			break;
+		}
 	}
 
-	pthread_rwlock_wrlock(&vpp_stats_cache_lock);
-	if (vpp_stats_filter)
-		_free(vpp_stats_filter);
-	vpp_stats_filter = copy;
-	vpp_stats_filter_len = count;
-	pthread_rwlock_unlock(&vpp_stats_cache_lock);
+	free(a->names);
+	a->names = NULL;
+	a->n = 0;
+	return -1;
+}
 
+int vpphook_stats_if_names(void (*cb)(uint32_t sw_if_index, const char *name, void *arg), void *arg)
+{
+	struct vs_names_arg a = { NULL, 0 };
+	uint32_t i;
+
+	if (vs_with_map(vpp_instance_pid(), vs_names_fn, &a))
+		return -1;
+
+	for (i = 0; i < a.n; i++) {
+		if (a.names[i][0])
+			cb(i, a.names[i], arg);
+	}
+
+	free(a.names);
 	return 0;
 }
-
-int vpphook_stats_batch_begin(void)
-{
-	int ret;
-
-	/* Acquire batch mutex before any state changes.
-	 * Released by vpphook_stats_batch_end() or on error paths below. */
-	pthread_mutex_lock(&vpp_stats_batch_mutex);
-
-	if (vpp_stats_connect()) {
-		pthread_mutex_unlock(&vpp_stats_batch_mutex);
-		return -1;
-	}
-
-	/*
-	 * Invalidate cache and reset batch mode flag BEFORE attempting refresh.
-	 * This ensures we never serve stale data if refresh fails.
-	 */
-	pthread_rwlock_wrlock(&vpp_stats_cache_lock);
-	vpp_stats_cache_valid = 0;
-	vpp_stats_batch_active = 0;
-	pthread_rwlock_unlock(&vpp_stats_cache_lock);
-
-	/*
-	 * Attempt to refresh the cache with current VPP statistics.
-	 * If this fails (e.g., due to VPP being down, excessive indices, or
-	 * memory allocation failure), we remain in non-batch mode.
-	 */
-	ret = vpp_stats_cache_refresh();
-	if (ret != 0) {
-		log_error("vpp_stats: batch mode initialization failed, "
-		          "falling back to per-session stats collection\n");
-		pthread_mutex_unlock(&vpp_stats_batch_mutex);
-		return -1;
-	}
-
-	/*
-	 * Cache refresh succeeded - activate batch mode.
-	 * All subsequent vpphook_read_stats() calls will use the cached data
-	 * until vpphook_stats_batch_end() is called.
-	 */
-	pthread_rwlock_wrlock(&vpp_stats_cache_lock);
-	vpp_stats_batch_active = 1;
-	pthread_rwlock_unlock(&vpp_stats_cache_lock);
-
-	return 0;
-}
-
-void vpphook_stats_batch_end(void)
-{
-	/*
-	 * Deactivate batch mode. Subsequent stats queries will fall back to
-	 * individual per-session collection via vpp_stats_read_interface().
-	 * The cache remains allocated but marked invalid until the next batch begin.
-	 */
-	pthread_rwlock_wrlock(&vpp_stats_cache_lock);
-	vpp_stats_batch_active = 0;
-	vpp_stats_cache_valid = 0;  /* Mark cache invalid for safety */
-	pthread_rwlock_unlock(&vpp_stats_cache_lock);
-	/* Release the batch mutex acquired in vpphook_stats_batch_begin,
-	 * allowing the next CLI command to start a new batch. */
-	pthread_mutex_unlock(&vpp_stats_batch_mutex);
-}
-
-static void vpp_stats_inotify_init(void)
-{
-	vpp_stats_inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-	if (vpp_stats_inotify_fd < 0) {
-		log_warn("vpp_stats: inotify_init failed, VPP restart detection disabled\n");
-		return;
-	}
-
-	memset(&vpp_stats_inotify_ctx, 0, sizeof(vpp_stats_inotify_ctx));
-	memset(&vpp_stats_inotify_hnd, 0, sizeof(vpp_stats_inotify_hnd));
-	memset(&vpp_stats_health_timer, 0, sizeof(vpp_stats_health_timer));
-	vpp_stats_inotify_ctx.close = vpp_stats_inotify_close;
-	triton_context_register(&vpp_stats_inotify_ctx, NULL);
-	vpp_stats_inotify_hnd.fd = vpp_stats_inotify_fd;
-	vpp_stats_inotify_hnd.read = vpp_stats_inotify_read;
-	triton_md_register_handler(&vpp_stats_inotify_ctx, &vpp_stats_inotify_hnd);
-	triton_md_enable_handler(&vpp_stats_inotify_hnd, MD_MODE_READ);
-	vpp_stats_health_timer.expire = vpp_stats_health_check;
-	vpp_stats_health_timer.expire_tv.tv_sec = VPP_STATS_HEALTH_CHECK_INTERVAL;
-	triton_timer_add(&vpp_stats_inotify_ctx, &vpp_stats_health_timer, 0);
-	triton_context_wakeup(&vpp_stats_inotify_ctx);
-}
-
-DEFINE_INIT(19, vpp_stats_inotify_init);

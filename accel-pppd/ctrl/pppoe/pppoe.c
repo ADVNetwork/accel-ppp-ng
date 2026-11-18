@@ -52,6 +52,8 @@ struct pppoe_conn_t {
 	uint16_t sid;
 	uint8_t addr[ETH_ALEN];
 	unsigned int ppp_started:1;
+	/* the session hooks keep the sid after the session ends, see disconnect() */
+	unsigned int sid_held:1;
 
 	struct pppoe_tag *relay_sid;
 	struct pppoe_tag *host_uniq;
@@ -149,6 +151,7 @@ struct monitored_link_list_entry_t * monitored_link_list_find(const char *name);
 static uint8_t bc_addr[ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 static void pppoe_send_PADT(struct pppoe_conn_t *conn);
+void pppoe_sid_release(uint16_t sid);
 void pppoe_server_free(struct pppoe_serv_t *serv);
 static int init_secret(struct pppoe_serv_t *serv);
 static void __pppoe_server_start(const char *ifname, const char *opt, void *cli, int parent_ifindex, int vid, int vlan_mon);
@@ -177,6 +180,17 @@ static void pppoe_serv_start_timer(struct pppoe_serv_t *serv)
 		pppoe_disc_stop(serv);
 		pppoe_server_free(serv);
 	}
+}
+
+/* Make a session id available again (also called by the session hooks). */
+void __export pppoe_sid_release(uint16_t sid)
+{
+	if (!sid)
+		return;
+
+	pthread_mutex_lock(&sid_lock);
+	sid_map[sid/(8*sizeof(long))] |= 1lu << (sid % (8*sizeof(long)));
+	pthread_mutex_unlock(&sid_lock);
 }
 
 static void disconnect(struct pppoe_conn_t *conn)
@@ -210,9 +224,13 @@ static void disconnect(struct pppoe_conn_t *conn)
 	} else
 		pthread_mutex_unlock(&serv->lock);
 
-	pthread_mutex_lock(&sid_lock);
-	sid_map[conn->sid/(8*sizeof(long))] |= 1lu << (conn->sid % (8*sizeof(long)));
-	pthread_mutex_unlock(&sid_lock);
+	/*
+	 * A session id that the session hooks still hold (the dataplane did
+	 * not confirm that its session is gone) is not handed out again: the
+	 * hooks give it back with pppoe_sid_release().
+	 */
+	if (!conn->sid_held)
+		pppoe_sid_release(conn->sid);
 
 	_free(conn->ctrl.service_name);
 	_free(conn->ctrl.calling_station_id);
@@ -239,8 +257,14 @@ int pppoe_terminate(struct ap_session *ses, int hard) {
 	int ret = 0;
 
 #ifdef HAVE_SESSION_HOOKS
-	if (ses->hooks && ses->hooks->pppoe_terminate)
-		ses->hooks->pppoe_terminate(ses, hard);
+	/* > 0: the hooks keep the session id, see disconnect() */
+	if (ses->hooks && ses->hooks->pppoe_terminate &&
+	    ses->hooks->pppoe_terminate(ses, hard) > 0) {
+		struct ppp_t *ppp = container_of(ses, typeof(*ppp), ses);
+		struct pppoe_conn_t *conn = container_of(ppp, typeof(*conn), ppp);
+
+		conn->sid_held = 1;
+	}
 #endif /* HAVE_SESSION_HOOKS */
 
 	ret = ppp_terminate(ses, hard);

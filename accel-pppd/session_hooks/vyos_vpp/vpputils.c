@@ -6,6 +6,7 @@
 
 #include <vapi/vapi.h>
 #include <vapi/vpe.api.vapi.h>
+#include <vapi/memclnt.api.vapi.h>
 
 #include <pthread.h>
 #include <time.h>
@@ -15,6 +16,8 @@
 #include "log.h"
 
 #include "vpputils.h"
+#include "vpphooks.h"
+#include "vppstats.h"
 #include "vppreconcile.h"
 
 /*
@@ -33,6 +36,13 @@
 #define VPP_RECONCILE_RETRY_MIN_SEC 5
 #define VPP_RECONCILE_RETRY_MAX_SEC 60
 
+/*
+ * Wait after a connection attempt that failed. With VPP down, every session
+ * that ends asks for the connection several times, and thousands end
+ * together: without the wait each of those calls was a new attempt.
+ */
+#define VPP_CONNECT_RETRY_MS 200
+
 int sc_vpp_queue_size = 1024;
 
 /*
@@ -42,6 +52,17 @@ int sc_vpp_queue_size = 1024;
 static int vpp_reconciled;
 static time_t vpp_reconcile_failed_at;
 static int vpp_reconcile_retry_sec = VPP_RECONCILE_RETRY_MIN_SEC;
+
+/* Monotonic time of the last failed connection attempt (vpp_lock held). */
+static struct timespec vpp_connect_failed_at;
+static int vpp_connect_failed;
+
+/*
+ * The VPP process of the current connection, or of the last one (vpputils.h).
+ * Written with vpp_lock held; read from any thread.
+ */
+static uint32_t vpp_gen;
+static uint32_t vpp_pid;
 
 struct vpp_connect_t
 {
@@ -56,9 +77,61 @@ const char vpp_app_name[] = "accel-vpp";
 
 void vpppoe_disconnect_from_vpp();
 
+uint32_t vpp_generation(void)
+{
+	return __atomic_load_n(&vpp_gen, __ATOMIC_ACQUIRE);
+}
+
+uint32_t vpp_instance_pid(void)
+{
+	return __atomic_load_n(&vpp_pid, __ATOMIC_ACQUIRE);
+}
+
+void vpp_instance(uint32_t *gen, uint32_t *pid)
+{
+	*gen = vpp_gen;
+	*pid = vpp_pid;
+}
+
+static vapi_error_e vpp_ping_cb(struct vapi_ctx_s *ctx, void *callback_ctx, vapi_error_e rv,
+				bool is_last, vapi_payload_control_ping_reply *reply)
+{
+	uint32_t *pid = callback_ctx;
+
+	if (rv == VAPI_OK && reply && pid && reply->retval == 0)
+		*pid = reply->vpe_pid;
+
+	return rv;
+}
+
+/*
+ * vpp_lock held. The pid of the VPP process, or 0 when it did not answer; the
+ * connection is then dropped, unless the request could not even be made.
+ */
+static uint32_t vpp_ping(void)
+{
+	vapi_ctx_t ctx = vpp_connect.vapi;
+	vapi_msg_control_ping *req;
+	vapi_error_e err;
+	uint32_t pid = 0;
+
+	if (ctx == NULL)
+		return 0;
+
+	req = vapi_alloc_control_ping(ctx);
+	if (req == NULL)
+		return 0;
+
+	err = vapi_control_ping(ctx, req, vpp_ping_cb, &pid);
+	err = vpp_vapi_complete(err);
+
+	return err == VAPI_OK ? pid : 0;
+}
+
 static void vpppoe_connect_to_vpp()
 {
 	struct timespec now;
+	uint32_t pid;
 
 	vpp_connect.vapi = NULL;
 
@@ -67,18 +140,53 @@ static void vpppoe_connect_to_vpp()
 	    now.tv_sec - vpp_reconcile_failed_at < vpp_reconcile_retry_sec)
 		return;
 
+	if (vpp_connect_failed &&
+	    (now.tv_sec - vpp_connect_failed_at.tv_sec) * 1000 +
+	    (now.tv_nsec - vpp_connect_failed_at.tv_nsec) / 1000000 < VPP_CONNECT_RETRY_MS)
+		return;
+
 	vapi_error_e verr = vapi_ctx_alloc(&vpp_connect.vapi);
 
 	if (verr != VAPI_OK || vpp_connect.vapi == NULL) {
 		vpp_connect.vapi = NULL;
-		return;
+		goto failed;
 	}
 
 	verr = vapi_connect_ex(vpp_connect.vapi, vpp_app_name, NULL, sc_vpp_queue_size, sc_vpp_queue_size, VAPI_MODE_BLOCKING, true, true);
 	if (verr != VAPI_OK) {
 		vapi_ctx_free(vpp_connect.vapi);
 		vpp_connect.vapi = NULL;
-		return;
+		goto failed;
+	}
+
+	/*
+	 * Which VPP is this? Nobody gets the context before the answer: what
+	 * the sessions keep of VPP is only good for the process that made it.
+	 */
+	pid = vpp_ping();
+	if (!pid) {
+		log_error("vpp: connected, but VPP did not answer the control ping\n");
+		vpppoe_disconnect_from_vpp();
+		goto failed;
+	}
+
+	if (vpp_connect_failed) {
+		vpp_connect_failed = 0;
+		log_warn("vpp: connected to VPP again\n");
+	}
+
+	if (pid != vpp_pid) {
+		int restarted = vpp_pid != 0;
+
+		if (restarted)
+			log_warn("vpp: VPP restarted (pid %u, was %u): the sessions made in the previous "
+				 "process are gone from the dataplane and will be terminated\n", pid, vpp_pid);
+
+		__atomic_store_n(&vpp_pid, pid, __ATOMIC_RELEASE);
+		__atomic_store_n(&vpp_gen, vpp_gen + 1, __ATOMIC_RELEASE);
+
+		if (restarted)
+			vpphook_vpp_restarted();
 	}
 
 	if (vpp_reconciled)
@@ -107,6 +215,13 @@ static void vpppoe_connect_to_vpp()
 	log_error("vpp: startup reconciliation failed, no session will be created until it succeeds "
 		  "(retry in %d s)\n", vpp_reconcile_retry_sec);
 	vpppoe_disconnect_from_vpp();
+	return;
+
+failed:
+	if (!vpp_connect_failed)
+		log_warn("vpp: no connection to VPP (not running, or not answering)\n");
+	vpp_connect_failed = 1;
+	clock_gettime(CLOCK_MONOTONIC, &vpp_connect_failed_at);
 }
 
 void vpppoe_disconnect_from_vpp()
@@ -116,6 +231,19 @@ void vpppoe_disconnect_from_vpp()
 		vapi_ctx_free(vpp_connect.vapi);
 		vpp_connect.vapi = NULL;
 	}
+
+	/* VPP may be gone: nothing of it stays mapped (vppstats.c) */
+	vpp_stats_drop();
+}
+
+void vpp_connection_lost(void)
+{
+	/* a thread in the middle of a call finds out by itself */
+	if (pthread_mutex_trylock(&vpp_connect.lock_vpp))
+		return;
+
+	vpppoe_disconnect_from_vpp();
+	pthread_mutex_unlock(&vpp_connect.lock_vpp);
 }
 
 struct vapi_ctx_s *vpp_peek_vapi(void)
@@ -128,6 +256,34 @@ struct vapi_ctx_s * vpp_get_vapi() {
 		vpppoe_connect_to_vpp();
 	}
 	return vpp_connect.vapi;
+}
+
+struct vapi_ctx_s *vpp_get_vapi_gen(uint32_t gen)
+{
+	struct vapi_ctx_s *ctx = vpp_get_vapi();
+
+	return (ctx && vpp_gen == gen) ? ctx : NULL;
+}
+
+int vpp_keepalive(void)
+{
+	int up;
+
+	/* someone is talking to VPP right now: that call finds out by itself */
+	if (pthread_mutex_trylock(&vpp_connect.lock_vpp))
+		return 1;
+
+	if (__atomic_load_n(&vpp_connect.rfcounter, __ATOMIC_SEQ_CST)) {
+		if (vpp_connect.vapi == NULL)
+			vpppoe_connect_to_vpp();
+		else
+			vpp_ping();
+	}
+
+	up = vpp_connect.vapi != NULL;
+	pthread_mutex_unlock(&vpp_connect.lock_vpp);
+
+	return up;
 }
 
 void vpp_lock() {

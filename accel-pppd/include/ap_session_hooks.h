@@ -32,14 +32,26 @@ struct ap_session_hooks_t {
 	 * called from ap_session_activate()
 	 */
 	int (*pppoe_create_session_interface)(struct ap_session *ses);
+	/*
+	 * Session is ending: remove it from the dataplane. May be called more
+	 * than once. A return > 0 means the dataplane did not confirm that
+	 * the session is gone: the PPPoE session id is not given out again
+	 * until the hooks call pppoe_sid_release().
+	 */
 	int (*pppoe_terminate)(struct ap_session *ses, int hard);
-	/* optional stats hook for non-kernel interfaces */
+	/*
+	 * Optional stats hook for non-kernel interfaces. A failure means the
+	 * counters cannot be read now, not that the session is gone: the
+	 * caller keeps the last values it read (ap_session_read_stats).
+	 */
 	int (*read_stats)(struct ap_session *ses, struct rtnl_link_stats64 *stats);
-	/* optional bulk stats hooks (per command) */
-	int (*stats_batch_set_filter)(const uint32_t *if_indices, size_t count);
-	int (*stats_batch_begin)(void);
-	void (*stats_batch_end)(void);
-	int (*get_sw_if_index)(struct ap_session *ses, uint32_t *sw_if_index);
+	/*
+	 * Were the bulk stats hooks (stats_batch_set_filter, stats_batch_begin,
+	 * stats_batch_end, get_sw_if_index), removed on 2026-11-18. The slots
+	 * stay, always NULL, so that the fields below keep their place for a
+	 * module built before that.
+	 */
+	void *reserved_stats[4];
 
 	/* route related hooks called from accel_iputils */
 	int (*ipaddr_add)(struct ap_session *ses, int ifindex, in_addr_t addr, int mask);
