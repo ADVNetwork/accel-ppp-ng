@@ -64,6 +64,9 @@ extern pthread_rwlock_t ses_lock;
 #define VPP_ROUTE_WATCHDOG_PERIOD_MS 60000
 #define VPP_ROUTE_WATCHDOG_BOOT_SKIP_SEC 120
 #define VPP_ROUTE_WATCHDOG_MIN_SESSION_AGE_SEC 60
+/* More sessions than this starting, or ending, at once: the round is skipped. */
+#define VPP_ROUTE_WATCHDOG_MAX_STARTING 50
+#define VPP_ROUTE_WATCHDOG_MAX_FINISHING 50
 
 /* Module timer: connection check, deferred cleanup, sweep after a VPP restart. */
 #define VPP_TICK_MS 2000
@@ -786,15 +789,23 @@ static void vpphook_route_watchdog(struct triton_timer_t *t)
 	struct ipv6db_addr_t *v6p;
 	char ipbuf[INET_ADDRSTRLEN];
 	char ip6buf[INET6_ADDRSTRLEN];
-	time_t now = time(NULL);
+	/* the clock of ses->start_time: with time() no session was ever young */
+	time_t now = _time();
 	int route_st;
 
 	/* Skip bring-up storm: mass create holds vpp_lock for seconds per batch. */
 	if (now - vpp_route_watchdog_boot < VPP_ROUTE_WATCHDOG_BOOT_SKIP_SEC)
 		return;
 
-	/* Sessions still activating or mass teardown in progress — VPP may lag. */
-	if (ap_session_stat.starting > 0 || ap_session_stat.finishing > 50)
+	/*
+	 * Mass bring-up or teardown in progress: VPP may lag, and the lookups
+	 * below would compete with it for vpp_lock. A few sessions starting is
+	 * the normal state of a BNG (one CPE that keeps failing to authenticate
+	 * is enough): skipping on any of them left the watchdog without ever
+	 * running. A session that is itself young is skipped below, by its age.
+	 */
+	if (ap_session_stat.starting > VPP_ROUTE_WATCHDOG_MAX_STARTING ||
+	    ap_session_stat.finishing > VPP_ROUTE_WATCHDOG_MAX_FINISHING)
 		return;
 
 	pthread_rwlock_rdlock(&ses_lock);
@@ -1013,7 +1024,7 @@ static void vpphooks_init()
 	vpp_tick_timer.period = VPP_TICK_MS;
 	triton_timer_add(&vpp_ctx, &vpp_tick_timer, 0);
 
-	vpp_route_watchdog_boot = time(NULL);
+	vpp_route_watchdog_boot = _time();
 	vpp_route_watchdog_timer.expire = vpphook_route_watchdog;
 	vpp_route_watchdog_timer.period = VPP_ROUTE_WATCHDOG_PERIOD_MS;
 	triton_timer_add(&vpp_ctx, &vpp_route_watchdog_timer, 0);
