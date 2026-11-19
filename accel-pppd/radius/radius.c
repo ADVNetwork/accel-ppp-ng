@@ -864,6 +864,21 @@ static void force_interim_update(struct ap_session *ses)
 	rad_acct_force_interim_update(rpd);
 }
 
+/*
+ * An NCP opened after the session start: an interim update now, if the
+ * accounting request has not the address of that protocol yet.
+ */
+static void ses_late_addr(struct ap_session *ses)
+{
+	struct radius_pd_t *rpd = find_pd(ses);
+
+	if (ses->terminating || !rpd)
+		return;
+
+	if ((ses->ipv4 && !rpd->ipv4_sent) || (ses->ipv6 && !rpd->ipv6_sent))
+		rad_acct_force_interim_update(rpd);
+}
+
 struct radius_pd_t *find_pd(struct ap_session *ses)
 {
 	struct ap_private *pd;
@@ -1345,6 +1360,8 @@ static void radius_init(void)
 	triton_event_register_handler(EV_SES_FINISHING, (triton_event_func)ses_finishing);
 	triton_event_register_handler(EV_SES_FINISHED, (triton_event_func)ses_finished);
 	triton_event_register_handler(EV_FORCE_INTERIM_UPDATE, (triton_event_func)force_interim_update);
+	triton_event_register_handler(EV_SES_IPV4_LATE, (triton_event_func)ses_late_addr);
+	triton_event_register_handler(EV_SES_IPV6_LATE, (triton_event_func)ses_late_addr);
 	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
 
     cli_register_simple_cmd2(realm_change_exec, NULL, 2, "realm", "change");

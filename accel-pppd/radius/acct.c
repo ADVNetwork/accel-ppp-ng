@@ -154,6 +154,35 @@ static void rad_acct_timeout(struct triton_timer_t *t)
 	}
 }
 
+/*
+ * The accounting request is made once, at the start, and used again for the
+ * interim updates and for the stop. An address that the session got later
+ * (its NCP opened after the session was up) was never in it. Returns how
+ * many families were added now.
+ */
+static int rad_acct_add_late_addr(struct radius_pd_t *rpd)
+{
+	struct ap_session *ses = rpd->ses;
+	struct ipv6db_addr_t *a;
+	int n = 0;
+
+	if (ses->ipv4 && ses->ipv4->peer_addr && !rpd->ipv4_sent) {
+		rad_packet_add_ipaddr(rpd->acct_req->pack, NULL, "Framed-IP-Address", ses->ipv4->peer_addr);
+		rpd->ipv4_sent = 1;
+		n++;
+	}
+
+	if (ses->ipv6 && !rpd->ipv6_sent) {
+		rad_packet_add_ifid(rpd->acct_req->pack, NULL, "Framed-Interface-Id", ses->ipv6->peer_intf_id);
+		list_for_each_entry(a, &ses->ipv6->addr_list, entry)
+			rad_packet_add_ipv6prefix(rpd->acct_req->pack, NULL, "Framed-IPv6-Prefix", &a->addr, a->prefix_len);
+		rpd->ipv6_sent = 1;
+		n++;
+	}
+
+	return n;
+}
+
 static void rad_acct_interim_update(struct triton_timer_t *t)
 {
 	struct radius_pd_t *rpd = container_of(t, typeof(*rpd), acct_interim_timer);
@@ -180,6 +209,9 @@ static void rad_acct_interim_update(struct triton_timer_t *t)
 		rpd->ipv6_dp_sent = 1;
 		force = 1;
 	}
+
+	if (rad_acct_add_late_addr(rpd))
+		force = 1;
 
 	if (!rpd->acct_interim_interval && !force)
 		return;
@@ -208,7 +240,16 @@ static void rad_acct_interim_update(struct triton_timer_t *t)
 
 void rad_acct_force_interim_update(struct radius_pd_t *rpd)
 {
-	if (!rpd->acct_req)
+	/*
+	 * Not before the start is answered: until then acct_req is the start
+	 * itself. With req-limit it may be waiting in the server queue, or
+	 * just taken off it and not sent yet, with no timer armed, and the
+	 * interim timer does not exist: rad_acct_interim_update() would send
+	 * the start a second time and, with acct-interim-jitter, change a
+	 * timer that was never added. What the request lacks goes in the
+	 * first periodic interim update, or in the stop.
+	 */
+	if (!rpd->acct_req || !rpd->acct_started)
 		return;
 
 	rad_acct_interim_update(&rpd->acct_interim_timer);
@@ -486,6 +527,9 @@ int rad_acct_stop(struct radius_pd_t *rpd)
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		req->ts = ts.tv_sec;
 		req->try = 0;
+
+		/* an address that came after the last interim update */
+		rad_acct_add_late_addr(rpd);
 	} else {
 		req = rad_req_alloc(rpd, CODE_ACCOUNTING_REQUEST, rpd->ses->username, 1);
 		if (!req)

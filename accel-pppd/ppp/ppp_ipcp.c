@@ -178,11 +178,16 @@ void ipcp_layer_free(struct ppp_layer_data_t *ld)
 
 static void __ipcp_layer_up(struct ppp_ipcp_t *ipcp)
 {
+	/* another NCP had already started the session */
+	int late = ipcp->ppp->ses.state == AP_STATE_ACTIVE;
+
 	log_ppp_debug("ipcp_layer_started\n");
 
 	if (!ipcp->started) {
 		ipcp->started = 1;
 		ppp_layer_started(ipcp->ppp, &ipcp->ld);
+		if (late)
+			ap_session_ipv4_late(&ipcp->ppp->ses);
 	}
 }
 

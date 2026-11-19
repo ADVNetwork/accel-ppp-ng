@@ -178,11 +178,16 @@ void ipv6cp_layer_free(struct ppp_layer_data_t *ld)
 
 static void __ipv6cp_layer_up(struct ppp_ipv6cp_t *ipv6cp)
 {
+	/* another NCP had already started the session */
+	int late = ipv6cp->ppp->ses.state == AP_STATE_ACTIVE;
+
 	log_ppp_debug("ipv6cp_layer_started\n");
 
 	if (!ipv6cp->started) {
 		ipv6cp->started = 1;
 		ppp_layer_started(ipv6cp->ppp, &ipv6cp->ld);
+		if (late)
+			ap_session_ipv6_late(&ipv6cp->ppp->ses);
 	}
 }
 

@@ -468,6 +468,15 @@ static void ev_ses_started(struct ap_session *ses)
 	}
 }
 
+/* IPv6CP opened after the session start: what ev_ses_started() did not do then */
+static void ev_ses_ipv6_late(struct ap_session *ses)
+{
+	if (find_pd(ses))
+		return;
+
+	ev_ses_started(ses);
+}
+
 static void ev_ses_finishing(struct ap_session *ses)
 {
 	struct ipv6_nd_handler_t *h = find_pd(ses);
@@ -662,6 +671,7 @@ static void init(void)
 
 	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
 	triton_event_register_handler(EV_SES_STARTED, (triton_event_func)ev_ses_started);
+	triton_event_register_handler(EV_SES_IPV6_LATE, (triton_event_func)ev_ses_ipv6_late);
 	triton_event_register_handler(EV_SES_FINISHING, (triton_event_func)ev_ses_finishing);
 }
 

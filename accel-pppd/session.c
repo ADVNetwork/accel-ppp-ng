@@ -169,6 +169,8 @@ void __export ap_session_activate(struct ap_session *ses)
 			ap_session_terminate(ses, TERM_NAS_ERROR, 0);
 			return;
 		}
+		/* the interface has the IPv4 the session has now, if any */
+		ses->ipv4_up = ses->ipv4 != NULL;
 	}
 #endif /* HAVE_SESSION_HOOKS */
 

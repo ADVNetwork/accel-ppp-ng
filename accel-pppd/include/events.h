@@ -18,6 +18,9 @@
 #define EV_SES_AUTH_FAILED  12
 #define EV_SES_PRE_FINISHED 13
 #define EV_SES_POST_STARTED 14
+/* An NCP opened on a session that was already up (ifcfg.c) */
+#define EV_SES_IPV4_LATE    15
+#define EV_SES_IPV6_LATE    16
 #define EV_IP_CHANGED       100
 #define EV_SHAPER           101
 #define EV_MPPE_KEYS        102

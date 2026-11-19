@@ -167,6 +167,15 @@ static struct dhcpv6_pd *find_pd(struct ap_session *ses)
 	return NULL;
 }
 
+/* IPv6CP opened after the session start: what ev_ses_started() did not do then */
+static void ev_ses_ipv6_late(struct ap_session *ses)
+{
+	if (find_pd(ses))
+		return;
+
+	ev_ses_started(ses);
+}
+
 static void ev_ses_finished(struct ap_session *ses)
 {
 	struct dhcpv6_pd *pd = find_pd(ses);
@@ -1181,6 +1190,7 @@ static void init(void)
 
 	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
 	triton_event_register_handler(EV_SES_STARTED, (triton_event_func)ev_ses_started);
+	triton_event_register_handler(EV_SES_IPV6_LATE, (triton_event_func)ev_ses_ipv6_late);
 	triton_event_register_handler(EV_SES_FINISHED, (triton_event_func)ev_ses_finished);
 }
 

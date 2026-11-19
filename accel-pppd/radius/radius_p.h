@@ -51,6 +51,9 @@ struct radius_pd_t {
 	unsigned int acct_started:1;
 	unsigned int ipv6_dp_assigned:1;
 	unsigned int ipv6_dp_sent:1;
+	/* the accounting request has the IPv4 / the IPv6 of the session */
+	unsigned int ipv4_sent:1;
+	unsigned int ipv6_sent:1;
 
 	struct rad_packet_t *auth_reply;
 

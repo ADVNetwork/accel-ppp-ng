@@ -237,6 +237,7 @@ int rad_req_acct_fill(struct rad_req_t *req)
 	if (req->rpd->ses->ipv4) {
 		if (rad_packet_add_ipaddr(req->pack, NULL, "Framed-IP-Address", req->rpd->ses->ipv4->peer_addr))
 			return -1;
+		req->rpd->ipv4_sent = 1;
 	}
 	if (req->rpd->ses->ipv6) {
 		if (rad_packet_add_ifid(req->pack, NULL, "Framed-Interface-Id", req->rpd->ses->ipv6->peer_intf_id))
@@ -245,6 +246,7 @@ int rad_req_acct_fill(struct rad_req_t *req)
 			if (rad_packet_add_ipv6prefix(req->pack, NULL, "Framed-IPv6-Prefix", &a->addr, a->prefix_len))
 				return -1;
 		}
+		req->rpd->ipv6_sent = 1;
 	}
 	if (req->rpd->ses->ipv6_dp) {
 		list_for_each_entry(a, &req->rpd->ses->ipv6_dp->prefix_list, entry) {

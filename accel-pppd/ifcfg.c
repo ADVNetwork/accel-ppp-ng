@@ -20,6 +20,7 @@
 #include "log.h"
 #include "backup.h"
 #include "config.h"
+#include "accel_iputils.h"
 #include "memdebug.h"
 
 #define VRF_DEFAULT_NAME "default"
@@ -214,8 +215,90 @@ skip_ifcfg:
 
 	ses->ctrl->started(ses);
 
+	/* ND and DHCPv6 start on this event, for the session that has IPv6 */
+	ses->ev_started = 1;
+	ses->ipv6_started = ses->ipv6 != NULL;
+
 	triton_event_fire(EV_SES_STARTED, ses);
 	triton_event_fire(EV_SES_POST_STARTED, ses);
+}
+
+/*
+ * An NCP that opens on a session that is already up.
+ *
+ * With ipv4=allow and ipv6=allow the session goes up on the first NCP that
+ * opens. In hooks mode its dataplane interface is made at that moment, with
+ * what the session has, and ND and DHCPv6 start on EV_SES_STARTED only for a
+ * session that has IPv6 by then. The protocol whose first Configure-Request
+ * comes later (a frame lost on the access and sent again seconds after, or a
+ * CPE that starts one NCP after the other) was left out: the session stayed
+ * without its IPv4 route in the dataplane, or without RA and DHCPv6, and its
+ * RADIUS accounting never had the address.
+ *
+ * Only for sessions with hooks. The kernel path is left as it was.
+ */
+void __export ap_session_ipv4_late(struct ap_session *ses)
+{
+#ifdef HAVE_SESSION_HOOKS
+	if (!ses->hooks || !ses->hooks->pppoe_create_session_interface)
+		return;
+
+	if (ses->state != AP_STATE_ACTIVE || ses->terminating)
+		return;
+
+	if (!ses->ipv4 || !ses->ipv4->peer_addr)
+		return;
+
+	/*
+	 * The address was known when the interface was made (the
+	 * Configure-Request came before the other NCP opened): nothing left
+	 * to do.
+	 */
+	if (ses->ipv4_up)
+		return;
+
+	if (accel_ipaddr_add_peer(ses, ses->ifindex, ses->ipv4->addr, ses->ipv4->peer_addr)) {
+		log_ppp_error("failed to set the IPv4 address of a session that was already up\n");
+		ap_session_terminate(ses, TERM_NAS_ERROR, 0);
+		return;
+	}
+
+	ses->ipv4_up = 1;
+
+	log_ppp_info2("IPv4 set up after the session start (IPCP opened after another NCP)\n");
+
+	triton_event_fire(EV_SES_IPV4_LATE, ses);
+#endif /* HAVE_SESSION_HOOKS */
+}
+
+void __export ap_session_ipv6_late(struct ap_session *ses)
+{
+#ifdef HAVE_SESSION_HOOKS
+	struct ipv6db_addr_t *a;
+
+	if (!ses->hooks || !ses->hooks->pppoe_create_session_interface)
+		return;
+
+	if (ses->state != AP_STATE_ACTIVE || ses->terminating || !ses->ipv6)
+		return;
+
+	/*
+	 * EV_SES_STARTED still to come (the accounting start has no answer
+	 * yet): it will find the IPv6. Fired with IPv6: ND and DHCPv6 run.
+	 */
+	if (!ses->ev_started || ses->ipv6_started)
+		return;
+
+	ses->ipv6_started = 1;
+
+	/* as ap_session_accounting_started() does for the session that has them */
+	list_for_each_entry(a, &ses->ipv6->addr_list, entry)
+		a->installed = 0;
+
+	log_ppp_info2("IPv6 set up after the session start (IPv6CP opened after another NCP)\n");
+
+	triton_event_fire(EV_SES_IPV6_LATE, ses);
+#endif /* HAVE_SESSION_HOOKS */
 }
 
 void __export ap_session_ifdown(struct ap_session *ses)

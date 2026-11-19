@@ -109,6 +109,15 @@ struct ap_session
 	unsigned int terminating:1;
 	unsigned int terminated:1;
 	unsigned int down:1;
+	/*
+	 * What a session with hooks was started with (ap_session_ipv4_late,
+	 * ap_session_ipv6_late): the dataplane interface was made with the
+	 * IPv4 of the session; EV_SES_STARTED was fired; the session had IPv6
+	 * by then, or got its ND and DHCPv6 since.
+	 */
+	unsigned int ipv4_up:1;
+	unsigned int ev_started:1;
+	unsigned int ipv6_started:1;
 	int terminate_cause;
 
 	struct list_head pd_list;
@@ -164,6 +173,8 @@ int ap_session_set_username(struct ap_session *ses, char *username);
 int ap_check_username(const char *username);
 
 void ap_session_ifup(struct ap_session *ses);
+void ap_session_ipv4_late(struct ap_session *ses);
+void ap_session_ipv6_late(struct ap_session *ses);
 void ap_session_ifdown(struct ap_session *ses);
 int ap_session_rename(struct ap_session *ses, const char *ifname, int len);
 #ifdef HAVE_VRF
