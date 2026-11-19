@@ -100,8 +100,21 @@ void __export ap_session_accounting_started(struct ap_session *ses)
 
 #ifdef HAVE_SESSION_HOOKS
 	/* Skip completely ifcfg routine for non-dev-ppp sessions */
-	if (ses->hooks && ses->hooks->pppoe_create_session_interface)
+	if (ses->hooks && ses->hooks->pppoe_create_session_interface) {
+		/*
+		 * The IPv6 addresses come from a pool and keep the "installed"
+		 * flag of the last session that had them. ipv6_nd and dhcpv6
+		 * install an address only while the flag is clear, so clear it
+		 * here, as the kernel path below does: without this, every
+		 * session after the pool's first round goes without the route
+		 * of its interface prefix in the dataplane.
+		 */
+		if (ses->ipv6) {
+			list_for_each_entry(a, &ses->ipv6->addr_list, entry)
+				a->installed = 0;
+		}
 		goto skip_ifcfg;
+	}
 #endif /* HAVE_SESSION_HOOKS */
 
 	memset(&ifr, 0, sizeof(ifr));
